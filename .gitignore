@@ -1,0 +1,29 @@
+# Dependencies and generated output
+node_modules/
+dist/
+dist-ui/
+android/build/
+coverage/
+
+# Local secrets and authentication
+.env
+.env.*
+!.env.example
+secrets/
+
+# Local execution state; keep source fixtures outside these directories
+.runtime/
+.local/
+logs/
+installed/
+.codex-remote-attachments/
+scripts/k-browser-native-host.diagnostic.json
+
+# Local editor and operating-system files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+# Test runtime artifact
+test/fixtures/descendant.pid

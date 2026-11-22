@@ -1,0 +1,1429 @@
+import {createWorkActivity, codexWorkActivity} from './work-activity.mjs';
+import {mkdir, lstat, readFile, writeFile} from 'node:fs/promises';
+import {createHash} from 'node:crypto';
+import path from 'node:path';
+import {atomicWrite} from './atomic-write.mjs';
+import {openCodexHost, disabledCodexMcpServer} from './codex-host.mjs';
+import {CODEX_READING_GUIDANCE} from './codex-reading.mjs';
+import {threadPermissions, turnPermissions} from './desktop-permissions.mjs';
+import {listMainModels} from './main-models.mjs';
+import {stopThreadTerminals} from './background-terminals.mjs';
+import {checkedPath} from './files.mjs';
+import {createGeminiWorker, UNKNOWN_OUTPUT_FILES_NOTE} from './gemini-worker.mjs';
+import {isAntigravityModel} from '../shared/antigravity-models.mjs';
+import {createClaudeWorker} from './claude-worker.mjs';
+import {createGrokWorker} from './grok-worker.mjs';
+import {createDeepSeekWorker} from './dsh-worker.mjs';
+import {createApiWorker, API_OUTPUT_FILES_NOTE} from './api-worker.mjs';
+import {randomUUID} from 'node:crypto';
+import {createWorkerWatch, workerObservation, workerNeedsAttention, workerNoticeKey} from './worker-watch.mjs';
+
+import {normalizeWorkerPolicy, validateWorkerPolicy, workerTaskScope, WORKER_SERVICE_RULE} from './worker-policy.mjs';
+import {codexCommonContext, commonMemoryReference} from './common-memory.mjs';
+const safeId = value =>
+  typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && value !== '.' && value !== '..';
+const clone = value => structuredClone(value);
+// Workers K runs as its own process or request, with no Codex thread: restart leaves them unowned, never replayed.
+const PROCESS_PROVIDERS = ['gemini', 'claude', 'grok', 'deepseek', 'api'];
+
+/** Compact model-facing result. Full output stays inside the parent's workspace. */
+export async function lunaResult(record) {
+  if (!record) return null;
+  const result = Object.fromEntries(
+    [
+      'requestId',
+      'provider',
+      'model',
+      'effort',
+      'status',
+      'settled',
+      'subWorkers',
+      'executionUnowned',
+      'reconciliation',
+      'acceptance',
+      'threadId',
+      'turnId',
+      'accountId',
+      'accountEmail',
+      'handoffFrom',
+      'error',
+      'dispatch',
+      'scheduling',
+      'deniedTools',
+      'toolErrors',
+      'outputFilesNote',
+      'outputFileDetails',
+      'failureKind',
+      'nativeError',
+      'activity',
+      'lastActivityAt',
+      'lastReadAt',
+      'startedAt',
+      'inspection',
+      'observation',
+      'waitingForApproval',
+      'pendingQuestion'
+    ]
+      .filter(key => record[key] !== undefined)
+      .map(key => [key, record[key]])
+  );
+  if (record.dispatch === 'not-started')
+    result.instruction =
+      '本次工具呼叫已返回，但工人未啟動，沒有執行此工單。若 scheduling.status=waiting，K 只在等待排程；無其他有用工作時用本入口的等待工具及 timeoutMs=null 等待此 requestId，不輪詢、不重派。就緒只代表可核對剩餘工作，不代表工單自動執行。';
+  if (record.executionUnowned === true) result.task = record.task;
+  const text = typeof record.output === 'string' ? record.output : '';
+  result.outputLength = text.length;
+  result.outputFiles = record.outputFiles ?? [];
+  if (record.provider === 'gemini') result.outputFilesNote ??= UNKNOWN_OUTPUT_FILES_NOTE;
+  if (!record.settled) {
+    if (text) result.outputPreview = text.slice(-1000);
+    result.outputFilesNote ??= '執行中已知檔案參考，不是完整成果清單或完成證據；請按需讀回原任務指定檔案。';
+    return result;
+  }
+  if (text.length <= 4000) {
+    result.output = text;
+    return result;
+  }
+  if (!safeId(record.parentId) || !safeId(record.requestId) || !path.isAbsolute(record.workspace ?? ''))
+    throw new Error('Invalid Luna output location.');
+  let directory = record.workspace;
+  // Check each component before descending; never follow a junction out of the workspace.
+  for (const part of ['.runtime', 'luna-bridge', record.parentId]) {
+    directory = path.join(directory, part);
+    try {
+      await mkdir(directory);
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+    const info = await lstat(directory);
+    if (info.isSymbolicLink() || !info.isDirectory()) throw new Error('Unsafe Luna output directory.');
+  }
+  const directoryRelative = path.join('.runtime', 'luna-bridge', record.parentId);
+  const primaryName = `${record.requestId}.output.md`;
+  const digest = createHash('sha256').update(text).digest('hex');
+  let fallback = false,
+    suffix = 0,
+    target;
+  for (;;) {
+    const name = fallback
+      ? suffix === 0
+        ? `${record.requestId}.output-${digest}.md`
+        : `${record.requestId}.output-${digest}-${suffix}.md`
+      : primaryName;
+    const relative = path.join(directoryRelative, name);
+    try {
+      target = await checkedPath(record.workspace, relative, false);
+      if ((await readFile(target, 'utf8')) === text) break;
+      target = undefined;
+      if (!fallback) {
+        fallback = true;
+        continue;
+      }
+      suffix++;
+      continue;
+    } catch (error) {
+      if (error.code !== 'ENOENT') throw error;
+      target = undefined;
+    }
+    const candidate = await checkedPath(record.workspace, relative, true);
+    try {
+      await writeFile(candidate, text, {encoding: 'utf8', flag: 'wx'});
+      target = candidate;
+      break;
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+    }
+  }
+  result.outputPreview = text.slice(0, 1000);
+  result.outputPath = target;
+  return result;
+}
+const normalizeWorkspace = value => {
+  if (typeof value !== 'string' || !value) return null;
+  const resolved = path.resolve(value).replaceAll('\\', '/').replace(/\/$/u, '');
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+};
+
+function itemText(item) {
+  if (typeof item?.text === 'string') return item.text;
+  return (item?.content ?? [])
+    .filter(part => part?.type === 'text')
+    .map(part => part.text)
+    .join('\n');
+}
+function filesFrom(items, workspace) {
+  const files = [];
+  for (const item of items ?? [])
+    if (item?.type === 'fileChange')
+      for (const change of item.changes ?? []) {
+        if (change.kind?.type === 'delete') continue;
+        const name = change.kind?.movePath ?? change.path;
+        if (typeof name !== 'string') continue;
+        const absolute = path.resolve(workspace, name),
+          relative = path.relative(workspace, absolute);
+        if (relative && !relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative))
+          files.push(relative.replaceAll('\\', '/'));
+      }
+  return [...new Set(files)];
+}
+function extractThread(thread, workspace, record) {
+  const turns = thread?.turns ?? [];
+  const items = turns.flatMap(turn => turn.items ?? []);
+  const latest = turns.at(-1);
+  const messages = items.filter(item => item.type === 'agentMessage').map(item => itemText(item));
+  record.output = messages.join('\n\n');
+  record.outputFiles = filesFrom(items, workspace);
+  if (thread?.status?.type === 'active' || latest?.status === 'inProgress') {
+    record.status = 'running';
+    record.settled = false;
+  } else if (latest?.status === 'interrupted') {
+    record.status = 'cancelled';
+    record.settled = true;
+  } else if (latest?.status === 'failed') {
+    record.status = 'failed';
+    record.settled = true;
+  } else if (!latest && record.cancelRequested && ['idle', 'notLoaded'].includes(thread?.status?.type)) {
+    record.status = 'cancelled';
+    record.settled = true;
+  } else if (['idle', 'notLoaded'].includes(thread?.status?.type) && latest?.status === 'completed') {
+    record.status = 'completed';
+    record.settled = true;
+  } else {
+    record.status = 'unresolved';
+    record.settled = false;
+  }
+}
+
+export async function createLunaBridge({
+  root,
+  workspace,
+  parentId,
+  executable,
+  accessMode = 'workspace-write',
+  workerPolicy,
+  hostFactory = openCodexHost,
+  geminiFactory = createGeminiWorker,
+  geminiOptions = {},
+  claudeFactory = createClaudeWorker,
+  claudeOptions = {},
+  grokFactory = createGrokWorker,
+  grokOptions = {},
+  deepseekFactory = createDeepSeekWorker,
+  deepseekOptions = {},
+  apiFactory = createApiWorker,
+  apiOptions = {},
+  geminiOnly = false,
+  onRequest,
+  onChange = () => {},
+  onGeminiHandoff = () => {},
+  watchOptions = {},
+  nested
+}) {
+  if (!root || !path.isAbsolute(workspace ?? '') || !safeId(parentId))
+    throw new Error('root、workspace 與 parentId 必須有效。');
+  const directory = path.join(root, '.runtime', 'luna-bridge', parentId);
+  let requestGuard = () => undefined;
+  let host, codexError, gemini, claude, grok, deepseek, api;
+  const processRuns = new Map();
+  // Second layers whose stop could not be confirmed, kept so cancel/close can retry; requestId → saved outcome.
+  const nestedCleanups = new Map();
+  const closeNested = context =>
+    context?.close().then(
+      () => null,
+      error => error
+    ) ?? Promise.resolve(null);
+  const snapshotRecord = record => {
+    if (!record) return null;
+    const current = handoffObservations.get(record.requestId),
+      scheduling =
+        current ??
+        (record.scheduling?.status === 'waiting'
+          ? {
+              ...record.scheduling,
+              status: 'unconfirmed',
+              notificationRegistered: false,
+              reason: '舊排程紀錄在本次沒有有效等候；先查目前條件，不重播原工單。'
+            }
+          : record.scheduling);
+    return {
+      ...clone(record),
+      ...(scheduling ? {scheduling: clone(scheduling)} : {}),
+      ...(PROCESS_PROVIDERS.includes(record.provider)
+        ? {
+            observation: workerObservation(record, {
+              owned: processRuns.has(record.requestId),
+              quietMs: watchOptions.quietMs
+            })
+          }
+        : {})
+    };
+  };
+  const records = new Map(),
+    activities = new Map();
+  const approvalItems = new Map();
+  // Only this live bridge can deliver an answer into the original native call.
+  const questions = new Map();
+  const operations = new Map(),
+    ownedThreads = new Set();
+  const persistTails = new Map();
+  const ownedRequests = new Set(),
+    revisions = new Map(),
+    waiters = new Map();
+  const handoffObservations = new Map();
+  let closed = false,
+    closing = false,
+    closePromise,
+    models;
+  let handoffEpoch = 0,
+    querySequence = 0,
+    accountQueryId = null;
+  const pendingHandoffs = [];
+  function observeHandoff(event) {
+    for (const id of [...event.requestIds, ...(event.queryIds ?? [])]) {
+      handoffObservations.set(id, {
+        status: event.status,
+        accountId: event.accountId,
+        reason: event.reason,
+        accountAvailable: event.accountAvailable,
+        busy: event.busy,
+        ...(event.nextQueryAt ? {nextQueryAt: event.nextQueryAt} : {}),
+        notificationRegistered: event.status === 'waiting'
+      });
+      for (const wake of waiters.get(id) ?? []) wake();
+    }
+  }
+  function flushHandoff() {
+    if (closed || closing) return;
+    for (let i = 0; i < pendingHandoffs.length;) {
+      const pending = pendingHandoffs[i],
+        event = pending.event;
+      if (pending.epoch !== handoffEpoch) {
+        pendingHandoffs.splice(i, 1);
+        continue;
+      }
+      // Account release precedes the worker result. Notify only after every old
+      // record in the room has its persisted settled result ready for inspection.
+      if (event.requestIds.some(id => records.get(id)?.settled !== true || persistTails.has(id))) {
+        i++;
+        continue;
+      }
+      pendingHandoffs.splice(i, 1);
+      observeHandoff(event);
+      try {
+        onGeminiHandoff(clone(event));
+      } catch {}
+    }
+  }
+  function receiveHandoff(event, epoch) {
+    if (closed || closing || epoch !== handoffEpoch || event.parentId !== parentId) return;
+    event = {...event, queryIds: (event.queryIds ?? []).filter(id => id === accountQueryId)};
+    if (!event.requestIds.length && !event.queryIds.length) return;
+    if (event.status !== 'waiting' && event.queryIds.length) accountQueryId = null;
+    if (event.status === 'waiting') {
+      observeHandoff(event);
+      // A quiet update only refreshes what wait/inspect report; the room was already told it is waiting.
+      if (event.quiet) return;
+      try {
+        onGeminiHandoff(clone(event));
+      } catch {}
+      return;
+    }
+    pendingHandoffs.push({event, epoch});
+    flushHandoff();
+  }
+  function cancelGeminiHandoff() {
+    handoffEpoch++;
+    accountQueryId = null;
+    pendingHandoffs.length = 0;
+    handoffObservations.clear();
+    for (const listeners of waiters.values()) for (const wake of listeners) wake();
+    geminiOptions.accounts?.cancelWorkerHandoff?.({parentId});
+  }
+  const defaults = normalizeWorkerPolicy(workerPolicy);
+  const quietSaved = new Map();
+  const watch = createWorkerWatch({
+    ...watchOptions,
+    inspect,
+    publish: (id, inspection) => {
+      const record = records.get(id);
+      if (!record || record.settled || record.cancelRequested || closed || closing) return;
+      record.inspection = inspection;
+      // Live activity is memory-only between start and end; save the quiet
+      // snapshot once per new evidence (the watch republishes every quiet
+      // interval), retrying on the next check only if the save failed.
+      const key = JSON.stringify([inspection.noticeId, inspection.lastActivityAt, inspection.pendingTool]);
+      if (quietSaved.get(id) !== key) {
+        quietSaved.set(id, key);
+        void persist(record).catch(() => {
+          if (quietSaved.get(id) === key) quietSaved.delete(id);
+        });
+      }
+      changed(record);
+    }
+  });
+  const changed = record => {
+    if (ownedRequests.has(record.requestId) && !closed && !closing) watch.observe(record);
+    if (record.settled) {
+      withdrawQuestion(record);
+      delete record.inspection;
+      quietSaved.delete(record.requestId);
+    }
+    for (const wake of waiters.get(record.requestId) ?? []) wake();
+    try {
+      onChange(clone(record));
+    } catch {}
+  };
+  function withdrawQuestion(record) {
+    const pending = questions.get(record.requestId);
+    if (!pending) return;
+    questions.delete(record.requestId);
+    delete record.pendingQuestion;
+    pending.reject(new Error('原工人的提問已失效。'));
+  }
+  function askParent(record, question, serverRequestId) {
+    if (closed || record.settled || !ownedRequests.has(record.requestId))
+      throw Error('原工單已停止、關閉或失去執行歸屬。');
+    const stopping = closing || record.cancelRequested;
+    const pending = questions.get(record.requestId);
+    if (stopping) {
+      if (!ownedThreads.has(record.threadId)) throw Error('原工單正在停止。');
+      // A native question may arrive while cancel is verifying the thread.
+      // Keep the tool suspended until the original turn stops.
+      if (pending) return pending.promise;
+    } else {
+      if (typeof question !== 'string' || !question.trim() || question.trim().length > 8000)
+        throw Error('提問須為 1 至 8000 字元的文字。');
+      if (pending) throw Error('請先等待上一題的回覆。');
+    }
+    const waiter = Promise.withResolvers();
+    questions.set(record.requestId, {...waiter, serverRequestId});
+    if (!stopping) {
+      revisions.set(record.requestId, (revisions.get(record.requestId) ?? 0) + 1);
+      record.status = 'running';
+      record.pendingQuestion = {id: randomUUID(), text: question.trim()};
+      delete record.inspection;
+      changed(record);
+    }
+    return waiter.promise;
+  }
+  function answer({requestId, questionId, answer}) {
+    if (typeof answer !== 'string' || !answer.trim() || answer.trim().length > 8000)
+      throw Error('回覆須為 1 至 8000 字元的文字。');
+    const record = records.get(requestId);
+    const pending = questions.get(requestId);
+    if (
+      !pending ||
+      closed ||
+      closing ||
+      record.cancelRequested ||
+      record.settled ||
+      record.pendingQuestion?.id !== questionId
+    )
+      throw Error('本工單目前沒有這一題可回覆。請讀回目前狀態。');
+    questions.delete(requestId);
+    delete record.pendingQuestion;
+    record.lastActivityAt = Date.now();
+    pending.resolve(answer.trim());
+    changed(record);
+    return snapshotRecord(record);
+  }
+  const persist = (record, patch) => {
+    const prior = persistTails.get(record.requestId) ?? Promise.resolve();
+    const next = prior
+      .catch(() => {})
+      .then(async () => {
+        await atomicWrite(
+          path.join(directory, `${record.requestId}.json`),
+          JSON.stringify({...record, ...patch}, null, 2)
+        );
+        // Publish a handling note only after its durable write, including when an
+        // inspect is queued concurrently. A failed save must not clear attention.
+        if (patch) Object.assign(record, patch);
+      });
+    persistTails.set(record.requestId, next);
+    // Keep a failed write visible to handoff/wait until a later successful save;
+    // in-memory terminal state alone does not prove the result was persisted.
+    void next
+      .then(() => {
+        if (persistTails.get(record.requestId) === next) persistTails.delete(record.requestId);
+      })
+      .catch(() => {});
+    return next;
+  };
+  const load = async requestId => {
+    if (records.has(requestId)) return records.get(requestId);
+    try {
+      const record = JSON.parse(await readFile(path.join(directory, `${requestId}.json`), 'utf8'));
+      if (record.requestId !== requestId || record.parentId !== parentId) throw new Error('Luna 工作紀錄身分不符。');
+      record.acceptance ??= 'not-reviewed';
+      record.outputFiles ??= [];
+      delete record.activity; // A saved observation is not evidence of a live worker after restart.
+      delete record.inspection;
+      delete record.waitingForApproval; // Saved approval state is not a live pending request.
+      delete record.pendingQuestion;
+      // Recovered records have no execution owner in this bridge. Reading them
+      // must not adopt an old PID or rewrite the persisted evidence.
+      if (!record.settled) {
+        record.executionUnowned = true;
+        record.status = 'unresolved';
+        record.error ??= 'K 重啟後子代理執行與完成結果無法確認；未重播。';
+      }
+      // A saved sub-worker snapshot is not evidence that it is still running; its second layer is never reloaded.
+      for (const sub of record.subWorkers ?? []) if (!sub.settled) sub.status = 'unresolved';
+      records.set(requestId, record);
+      return record;
+    } catch (error) {
+      if (error.code === 'ENOENT') return null;
+      throw error;
+    }
+  };
+  function event(message) {
+    const p = message.params ?? {};
+    if (message.method === 'serverRequest/resolved') {
+      for (const [id, question] of questions) {
+        const owner = records.get(id);
+        if (
+          owner.threadId !== p.threadId ||
+          owner.cancelRequested ||
+          closing ||
+          question.serverRequestId === undefined ||
+          question.serverRequestId !== p.requestId
+        )
+          continue;
+        withdrawQuestion(owner);
+        changed(owner);
+      }
+      return;
+    }
+    const record = [...records.values()].find(value => value.threadId && value.threadId === p.threadId);
+    if (!record) return;
+    revisions.set(record.requestId, (revisions.get(record.requestId) ?? 0) + 1);
+    if (message.method === 'turn/started') record.turnId = p.turn?.id ?? record.turnId;
+    if (!record.settled && (!record.turnId || !p.turnId || record.turnId === p.turnId)) {
+      if (!activities.has(record.requestId)) activities.set(record.requestId, createWorkActivity(record));
+      codexWorkActivity(activities.get(record.requestId), message);
+      if (record.activity?.lastEventAt != null)
+        record.lastActivityAt = Math.max(record.lastActivityAt ?? 0, record.activity.lastEventAt);
+      if (
+        record.status === 'unresolved' &&
+        (p.turnId ?? p.turn?.id) === record.turnId &&
+        /^(item\/|turn\/started$)/.test(message.method)
+      )
+        record.status = 'running';
+    }
+    const itemKey = `${p.threadId}:${p.turnId}:${p.item?.id}`;
+    // Pending file changes may arrive before thread/read includes the item.
+    if (message.method === 'item/started' && p.item?.type === 'fileChange' && p.turnId === record.turnId)
+      approvalItems.set(itemKey, clone(p.item));
+    if (message.method === 'item/completed') approvalItems.delete(itemKey);
+    if (message.method === 'item/completed' && p.item?.type === 'agentMessage')
+      record.output = (record.output ? `${record.output}\n\n` : '') + itemText(p.item);
+    if (message.method === 'item/completed' && p.item?.type === 'fileChange')
+      record.outputFiles = filesFrom([...(record.items ?? []), p.item], workspace);
+    if (message.method === 'turn/completed') {
+      const status = p.turn?.status;
+      withdrawQuestion(record);
+      record.status = status === 'interrupted' ? 'cancelled' : status === 'failed' ? 'failed' : 'completed';
+      record.settled = true;
+      for (const key of approvalItems.keys())
+        if (key.startsWith(`${p.threadId}:${p.turn?.id}:`)) approvalItems.delete(key);
+    }
+    void persist(record)
+      .then(() => changed(record))
+      .catch(() => {});
+  }
+  const guardedRequest = async message => {
+    const p = message?.params ?? {};
+    const record = [...records.values()].find(value => value.threadId && value.threadId === p.threadId);
+    if (!record || !record.threadId || (record.settled && record.status !== 'running')) return undefined;
+    if (record.turnId && p.turnId && record.turnId !== p.turnId) return undefined;
+    if (record.turnId && !p.turnId) return undefined;
+    if (message.method === 'item/tool/call' && p.tool === 'k_ask_parent' && !p.namespace) {
+      if (!ownedThreads.has(p.threadId) || !p.turnId) return undefined;
+      let waiting;
+      try {
+        waiting = askParent(record, p.arguments?.question, message.id);
+      } catch (error) {
+        return {success: false, contentItems: [{type: 'inputText', text: error.message}]};
+      }
+      const text = await waiting;
+      return {success: true, contentItems: [{type: 'inputText', text}]};
+    }
+    if (message.method === 'item/tool/requestUserInput') {
+      if (
+        !ownedThreads.has(p.threadId) ||
+        !p.turnId ||
+        !Array.isArray(p.questions) ||
+        !p.questions.length ||
+        p.questions.some(q => !q?.id || q.isSecret || typeof q.question !== 'string')
+      )
+        return undefined;
+      const answers = [];
+      for (const q of p.questions) {
+        const options = q.options?.map(option => option.label).join('、');
+        const text = await askParent(record, q.question + (options ? '\n選項：' + options : ''), message.id);
+        answers.push([q.id, {answers: [text]}]);
+      }
+      return {answers: Object.fromEntries(answers)};
+    }
+    let item;
+    if (p.itemId) {
+      try {
+        const result = await host.request('thread/read', {threadId: p.threadId, includeTurns: true});
+        item = result.thread?.turns?.find(turn => turn.id === p.turnId)?.items?.find(value => value.id === p.itemId);
+      } catch {}
+      if (!item?.changes?.length) item = approvalItems.get(`${p.threadId}:${p.turnId}:${p.itemId}`) ?? item;
+      if ((record.settled && record.status !== 'running') || (record.turnId && record.turnId !== p.turnId))
+        return undefined;
+    }
+    const response = onRequest?.(message, item);
+    if (!response?.then) return response;
+    record.waitingForApproval = (record.waitingForApproval ?? 0) + 1;
+    changed(record);
+    try {
+      return await response;
+    } finally {
+      if (--record.waitingForApproval === 0) {
+        delete record.waitingForApproval;
+        record.lastActivityAt = Date.now();
+      }
+      changed(record);
+    }
+  };
+  requestGuard = guardedRequest;
+  if (!geminiOnly)
+    try {
+      if (!executable) throw Error('Codex executable 必須有效。');
+      host = hostFactory({executable, cwd: root, onEvent: event, onRequest: message => requestGuard(message)});
+      void host.closed?.then(() => {
+        for (const record of records.values()) {
+          if (!ownedThreads.has(record.threadId) || record.settled) continue;
+          withdrawQuestion(record);
+          record.status = 'unresolved';
+          record.error = '原生工人連線已結束，成果待確認。';
+          changed(record);
+        }
+      });
+      await host.request('initialize', {
+        clientInfo: {name: 'k_harness_luna_bridge', version: '0.1.0'},
+        capabilities: {experimentalApi: true}
+      });
+      host.notify({method: 'initialized', params: {}});
+      const account = await host.request('account/read', {refreshToken: false});
+      if (account?.account?.type !== 'chatgpt')
+        throw new Error('Luna 工人需要既有 ChatGPT 訂閱登入；未切換 API 計費。');
+      models = await listMainModels(host);
+    } catch (error) {
+      codexError = error;
+      await host?.close?.().catch?.(() => {});
+      host = null;
+    }
+
+  async function inspect({requestId}) {
+    if (!safeId(requestId)) throw new Error('requestId 格式無效。');
+    const record = await load(requestId);
+    if (!record) return null;
+    if (questions.has(requestId) && !record.cancelRequested) return snapshotRecord(record);
+    if (PROCESS_PROVIDERS.includes(record.provider)) {
+      // A restarted bridge cannot own/adopt a saved PID (it may have been reused).
+      // Preserve ambiguity, including a lost result after side effects; never replay.
+      if (!record.settled && !processRuns.has(requestId) && !operations.has(requestId)) {
+        if (record.status !== 'unresolved') record.error = 'K 重啟後子代理程序與完成結果無法確認；未重播。';
+        record.status = 'unresolved';
+        await persist(record);
+        changed(record);
+      }
+      record.lastReadAt = new Date().toISOString();
+      return snapshotRecord(record);
+    }
+    if (!record.threadId) return clone(record);
+    if (!record.turnId && ownedThreads.has(record.threadId) && operations.has(requestId)) return clone(record);
+    const revision = revisions.get(requestId);
+    try {
+      const result = await host.request('thread/read', {threadId: record.threadId, includeTurns: true});
+      if (revisions.get(requestId) !== revision) return clone(record);
+      if (
+        result.thread?.id !== record.threadId ||
+        normalizeWorkspace(result.thread?.cwd) !== normalizeWorkspace(record.workspace ?? workspace)
+      ) {
+        record.status = 'unresolved';
+        record.settled = false;
+        await persist(record);
+        changed(record);
+        return clone(record);
+      }
+      extractThread(result.thread, record.workspace ?? workspace, record);
+      record.lastReadAt = new Date().toISOString();
+      await persist(record);
+      changed(record);
+    } catch (error) {
+      if (revisions.get(requestId) !== revision || record.settled) return clone(record);
+      // A turn/start acknowledgement can arrive before the very first rollout line.
+      // Keep that live receipt for this specific startup race; other read errors remain unresolved.
+      if (
+        ownedThreads.has(record.threadId) &&
+        record.status === 'running' &&
+        !record.lastReadAt &&
+        /rollout at [^\r\n]+ is empty$/iu.test(error?.protocolMessage)
+      )
+        return clone(record);
+      record.status = 'unresolved';
+      record.settled = false;
+      await persist(record).catch(() => {});
+      changed(record);
+    }
+    return clone(record);
+  }
+  async function start({requestId, task, model, effort, accountId, handoffFrom}) {
+    if (closed || closing) throw new Error('Luna bridge 正在關閉或已關閉。');
+    if (!safeId(requestId) || typeof task !== 'string' || !task.trim() || task.length > 32000)
+      throw new Error('requestId 或 task 無效。');
+    // A saved API consult model is never an implicit default: each paid consult names its model.
+    if (model === undefined && defaults.model?.startsWith('api:'))
+      throw Error('API 諮詢工人須在本人明確要求時明確指定 model 與 effort；省略型號不會沿用 API 模型，未派工。');
+    if (model?.startsWith('api:') && effort === undefined)
+      throw Error('API 諮詢工人須明確指定 effort（沒有推理設定時傳 null）；未派工。');
+    const choice = {model: model ?? defaults.model, effort: effort !== undefined ? effort : defaults.effort};
+    if (geminiOnly && !/^(gemini-|antigravity:|claude-|grok-|deepseek-|api:)/.test(choice.model))
+      throw Error(
+        '此入口只提供 Gemini、Claude、Grok 或 DeepSeek（及 API 諮詢模型）；GPT 子代理仍使用 Codex 原生派工。'
+      );
+    if (isAntigravityModel(choice.model))
+      return startProcess({provider: 'gemini', requestId, task, accountId, handoffFrom, ...choice});
+    if (choice.model.startsWith('claude-')) {
+      if (accountId !== undefined || handoffFrom !== undefined) throw Error('帳號選用與接手欄位只適用 Gemini。');
+      return startProcess({provider: 'claude', requestId, task, ...choice});
+    }
+    if (choice.model.startsWith('grok-')) {
+      if (accountId !== undefined || handoffFrom !== undefined) throw Error('帳號選用與接手欄位只適用 Gemini。');
+      return startProcess({provider: 'grok', requestId, task, ...choice});
+    }
+    if (choice.model.startsWith('deepseek-')) {
+      if (accountId !== undefined || handoffFrom !== undefined) throw Error('帳號選用與接手欄位只適用 Gemini。');
+      return startProcess({provider: 'deepseek', requestId, task, ...choice});
+    }
+    if (choice.model.startsWith('api:')) {
+      if (accountId !== undefined || handoffFrom !== undefined) throw Error('帳號選用與接手欄位只適用 Gemini。');
+      return startProcess({provider: 'api', requestId, task, ...choice});
+    }
+    if (accountId !== undefined || handoffFrom !== undefined) throw Error('帳號選用與接手欄位只適用 Gemini Flash。');
+    if (choice.model === 'auto' || choice.effort === 'auto')
+      throw new Error(
+        '目前是「AI 自動選擇」：請依這項工作的難度，明確指定原生目錄提供且已接通的模型，以及該模型支援的推理程度（沒有此設定時傳 null）；尚未開始工作。'
+      );
+    if (codexError) throw Error(`Codex 子代理初始化失敗：${codexError.message}；未轉派 Gemini。`);
+    const policy = validateWorkerPolicy(choice, models);
+    const existing = await inspect({requestId});
+    if (existing) {
+      if (existing.task !== task || existing.model !== policy.model || existing.effort !== policy.effort)
+        throw new Error('相同 requestId 已綁定不同 task 或模型設定；拒絕重送。');
+      return existing;
+    }
+    if (operations.has(requestId)) {
+      const pending = records.get(requestId);
+      if (pending?.task !== task || pending.model !== policy.model || pending.effort !== policy.effort)
+        throw new Error('相同 requestId 已綁定不同 task 或模型設定；拒絕重送。');
+      return operations.get(requestId);
+    }
+    const record = {
+      requestId,
+      parentId,
+      provider: 'codex',
+      model: policy.model,
+      effort: policy.effort,
+      status: 'starting',
+      startedAt: new Date().toISOString(),
+      settled: false,
+      acceptance: 'not-reviewed',
+      threadId: null,
+      turnId: null,
+      task,
+      output: '',
+      outputFiles: [],
+      workspace,
+      accessMode
+    };
+    records.set(requestId, record);
+    ownedRequests.add(requestId);
+    const operation = (async () => {
+      await persist(record);
+      changed(record);
+      const instruction = `你是 K HARNESS 的 Codex 子代理。只執行下列任務，不得再委派子代理。${workerTaskScope(accessMode)}若需要主代理回答才能完成，呼叫 k_ask_parent 並等待工具回傳後繼續，不在最終回覆留下待答問題。${WORKER_SERVICE_RULE}\n\n<DELEGATED_TASK>\n${task}\n</DELEGATED_TASK>`;
+      const permissions = threadPermissions(accessMode, workspace);
+      const effective = await host.request('config/read', {includeLayers: false, cwd: workspace});
+      const session = await host.request('thread/start', {
+        cwd: workspace,
+        model: policy.model,
+        dynamicTools: [
+          {
+            type: 'function',
+            name: 'k_ask_parent',
+            description: '向派工的主代理提問，等它回答後在本回合繼續工作。',
+            inputSchema: {
+              type: 'object',
+              properties: {question: {type: 'string'}},
+              required: ['question'],
+              additionalProperties: false
+            }
+          }
+        ],
+        developerInstructions: [
+          effective.config?.developer_instructions,
+          CODEX_READING_GUIDANCE,
+          commonMemoryReference(root)
+        ]
+          .filter(Boolean)
+          .join('\n'),
+        ...permissions,
+        config: {
+          ...permissions.config,
+          model_reasoning_effort: policy.effort,
+          mcp_servers: {...permissions.config?.mcp_servers, k_flash: disabledCodexMcpServer()},
+          agents: {enabled: false}
+        }
+      });
+      record.threadId = session.thread.id;
+      ownedThreads.add(record.threadId);
+      await persist(record);
+      changed(record);
+      if (record.cancelRequested) {
+        record.status = 'cancelled';
+        record.settled = true;
+        await persist(record);
+        changed(record);
+        return clone(record);
+      }
+      const begun = await host.request('turn/start', {
+        threadId: record.threadId,
+        model: policy.model,
+        effort: policy.effort,
+        input: [{type: 'text', text: instruction}],
+        additionalContext: codexCommonContext(root),
+        ...turnPermissions(accessMode, workspace)
+      });
+      record.turnId = begun.turn.id;
+      if (record.cancelRequested)
+        await host.request('turn/interrupt', {threadId: record.threadId, turnId: record.turnId});
+      if (record.status === 'starting') record.status = 'running';
+      await persist(record);
+      changed(record);
+      return clone(record);
+    })()
+      .catch(async error => {
+        // A request timeout can mean the native operation happened. Preserve ambiguity and require inspect.
+        record.status = /timed out|not confirmed|do not replay/i.test(error.message) ? 'unresolved' : 'failed';
+        record.settled = false;
+        record.error = error.message;
+        await persist(record).catch(() => {});
+        changed(record);
+        throw error;
+      })
+      .finally(() => operations.delete(requestId));
+    operations.set(requestId, operation);
+    return operation;
+  }
+  const processFailure = (error, provider) => ({
+    ...(error.workerResult ?? {}),
+    outputFilesNote:
+      error.outputFilesNote ??
+      error.workerResult?.outputFilesNote ??
+      (provider === 'api' ? API_OUTPUT_FILES_NOTE : UNKNOWN_OUTPUT_FILES_NOTE),
+    ...(provider === 'gemini'
+      ? {
+          failureKind: error.failureKind ?? 'unknown',
+          nativeError: String(error.nativeError ?? error.message).slice(0, 4000)
+        }
+      : {})
+  });
+  async function startProcess({provider, requestId, task, model, effort, accountId, handoffFrom}) {
+    if (model === 'auto' || effort === 'auto' || effort === undefined)
+      throw Error('請依原生目錄明確指定模型與推理程度；沒有推理設定時傳 null。未開始工作。');
+    if (accountId !== undefined && !/^[a-f0-9]{32}$/u.test(accountId)) throw Error('Gemini 帳號識別無效。');
+    if (accountId && !geminiOptions.accounts) throw Error('公開版使用目前官方登入。請省略 accountId，或先由使用者在官方入口換帳號。');
+    if (handoffFrom !== undefined && (!safeId(handoffFrom) || handoffFrom === requestId))
+      throw Error('接手必須使用新的工作 ID。');
+    const existing = await inspect({requestId});
+    if (existing) {
+      if (
+        existing.task !== task ||
+        existing.model !== model ||
+        existing.effort !== effort ||
+        existing.requestedAccountId !== accountId ||
+        existing.handoffFrom !== handoffFrom
+      )
+        throw Error('相同 requestId 已綁定不同 task、帳號或模型設定；拒絕重送。');
+      return operations.get(requestId) ?? existing;
+    }
+    // inspect yields; reserve synchronously after it to deduplicate concurrent starts.
+    const pending = records.get(requestId);
+    if (pending) {
+      if (
+        pending.task !== task ||
+        pending.model !== model ||
+        pending.effort !== effort ||
+        pending.requestedAccountId !== accountId ||
+        pending.handoffFrom !== handoffFrom
+      )
+        throw Error('相同 requestId 已綁定不同 task、帳號或模型設定；拒絕重送。');
+      return operations.get(requestId) ?? clone(pending);
+    }
+    if (closed || closing) throw Error('Luna bridge 正在關閉或已關閉。');
+    if (handoffFrom) {
+      const previous = await inspect({requestId: handoffFrom});
+      const valid =
+        previous &&
+        ['gemini', 'claude', 'grok', 'deepseek'].includes(previous.provider) &&
+        previous.settled === true &&
+        previous.executionUnowned !== true;
+      if (!valid) {
+        const prefix =
+          previous && previous.executionUnowned !== true && previous.provider === 'claude'
+            ? '原 Claude 工作'
+            : previous && previous.executionUnowned !== true && previous.provider === 'grok'
+              ? '原 Grok 工作'
+              : previous && previous.executionUnowned !== true && previous.provider === 'deepseek'
+                ? '原 DeepSeek 工作'
+                : previous && previous.executionUnowned !== true && previous.provider === 'gemini'
+                  ? '原 Gemini 工作'
+                  : '原工作';
+        throw Error(prefix + '尚未確認停止，不能接手或重播。');
+      }
+      return reserveProcess();
+    }
+    return reserveProcess();
+    function reserveProcess() {
+      if (closed || closing) throw Error('Luna bridge 正在關閉或已關閉。');
+      if (provider === 'gemini') geminiOptions.officialGeminiAccount?.assertStable();
+      if (records.has(requestId))
+        return startProcess({provider, requestId, task, model, effort, accountId, handoffFrom});
+      const record = {
+        requestId,
+        parentId,
+        provider,
+        model,
+        effort,
+        ...(provider === 'claude' ? {threadId: randomUUID()} : {}),
+        ...(provider === 'claude' && nested ? {subWorkers: []} : {}),
+        ...(accountId ? {requestedAccountId: accountId} : {}),
+        ...(handoffFrom ? {handoffFrom} : {}),
+        status: 'starting',
+        startedAt: new Date().toISOString(),
+        settled: false,
+        acceptance: 'not-reviewed',
+        task,
+        output: '',
+        outputFiles: [],
+        workspace,
+        accessMode
+      };
+      records.set(requestId, record);
+      ownedRequests.add(requestId);
+      const controller = new AbortController();
+      const handle = {controller, completion: null};
+      processRuns.set(requestId, handle);
+      const operation = (async () => {
+        await persist(record);
+        changed(record);
+        let nestedContext = null;
+        try {
+          // Claude main only: this Claude worker gets its own one-layer k_luna gateway.
+          if (provider === 'claude' && nested) {
+            nestedContext = await nested({
+              requestId,
+              accessMode: record.accessMode,
+              onChange: subRecord => {
+                if (!subRecord) return;
+                const entry = {
+                  requestId: subRecord.requestId,
+                  provider: subRecord.provider,
+                  model: subRecord.model,
+                  effort: subRecord.effort ?? null,
+                  status: subRecord.status,
+                  settled: subRecord.settled === true,
+                  startedAt: subRecord.startedAt,
+                  endedAt: subRecord.endedAt
+                };
+                record.subWorkers ??= [];
+                const idx = record.subWorkers.findIndex(item => item.requestId === entry.requestId);
+                if (idx >= 0) record.subWorkers[idx] = entry;
+                else record.subWorkers.push(entry);
+                void persist(record)
+                  .then(() => changed(record))
+                  .catch(() => {});
+              }
+            });
+          }
+          const worker =
+            provider === 'gemini'
+              ? (gemini ??= geminiFactory({...geminiOptions, root, workspace, accessMode}))
+              : provider === 'api'
+                ? (api ??= apiFactory({...apiOptions, root, workspace, accessMode}))
+                : provider === 'grok'
+                  ? (grok ??= grokFactory({...grokOptions, root, workspace, accessMode}))
+                  : provider === 'deepseek'
+                    ? (deepseek ??= deepseekFactory({...deepseekOptions, root, workspace, accessMode}))
+                    : (claude ??= claudeFactory({...claudeOptions, root, workspace, accessMode}));
+          const epoch = handoffEpoch;
+          handle.completion = Promise.resolve()
+            .then(() =>
+              worker.run({
+                task,
+                model,
+                effort,
+                sessionId: record.threadId,
+                accountId,
+                parentId,
+                requestId,
+                mcpConfig: nestedContext?.mcpConfig,
+                instructions: nestedContext?.instructions,
+                onHandoff: event => receiveHandoff(event, epoch),
+                handoffCurrent: () => !closed && !closing && !record.cancelRequested && epoch === handoffEpoch,
+                signal: controller.signal,
+                askParent: text => askParent(record, text),
+                onPermission: async value => {
+                  record.waitingForApproval = (record.waitingForApproval ?? 0) + 1;
+                  changed(record);
+                  let onAbort;
+                  try {
+                    // A cancelled worker must not leave its approval request pending forever.
+                    const cancelled = new Promise(resolve => {
+                      onAbort = () => resolve({behavior: 'deny', message: '子代理已取消；此核准請求失效。'});
+                      if (controller.signal.aborted) onAbort();
+                      else controller.signal.addEventListener('abort', onAbort, {once: true});
+                    });
+                    return await Promise.race([
+                      onRequest?.({
+                        method: 'k/claude/requestApproval',
+                        params: {threadId: record.threadId, parentId, requestId, ...value}
+                      }),
+                      cancelled
+                    ]);
+                  } finally {
+                    controller.signal.removeEventListener('abort', onAbort);
+                    if (--record.waitingForApproval === 0) delete record.waitingForApproval;
+                    record.lastActivityAt = Date.now();
+                    changed(record);
+                  }
+                },
+                onDiagnostic: value => {
+                  if (value.toolErrors) record.toolErrors = value.toolErrors;
+                  if (value.deniedTools) record.deniedTools = value.deniedTools;
+                  changed(record);
+                },
+                onActivity: value => {
+                  record.activity = value;
+                  if (value.lastEventAt != null) record.lastActivityAt = value.lastEventAt;
+                  changed(record);
+                },
+                onAccount: identity => {
+                  record.accountId = identity.accountId;
+                  record.accountEmail = identity.accountEmail;
+                },
+                onStart: pid => {
+                  record.pid = pid;
+                  record.status = 'running';
+                  record.startedAt = new Date().toISOString();
+                  void persist(record)
+                    .then(() => changed(record))
+                    .catch(() => {});
+                }
+              })
+            )
+            // The worker's own outcome is published only after its sub-workers are confirmed stopped.
+            .then(
+              async result => ({result, nestedError: await closeNested(nestedContext)}),
+              async error => ({error, nestedError: await closeNested(nestedContext)})
+            )
+            .then(({result, error, nestedError}) => {
+              withdrawQuestion(record);
+              if (!error) Object.assign(record, result);
+              else
+                Object.assign(record, processFailure(error, provider), {
+                  status: error.settled === false ? 'unresolved' : controller.signal.aborted ? 'cancelled' : 'failed',
+                  settled: error.settled !== false,
+                  error: error.message,
+                  // A refused start keeps its not-started proof even without a scheduling wait.
+                  ...(error.dispatch === 'not-started' ? {dispatch: 'not-started'} : {}),
+                  ...(error.scheduling ? {scheduling: clone(error.scheduling)} : {})
+                });
+              if (nestedError) {
+                // Keep the second layer so a later cancel or close can retry confirming its stop; never replay.
+                nestedCleanups.set(requestId, {context: nestedContext, status: record.status, settled: record.settled});
+                record.status = 'unresolved';
+                record.settled = false;
+                record.error = `${record.error ? `${record.error}；` : ''}小工人停止狀態未確認：${nestedError.message}`;
+              }
+            })
+            .then(async () => {
+              record.acceptance = 'not-reviewed';
+              record.endedAt = new Date().toISOString();
+              await persist(record);
+              changed(record);
+              flushHandoff();
+              return clone(record);
+            })
+            .finally(() => processRuns.delete(requestId));
+          // The completion promise owns persistence and notification, even if start
+          // returns before agy emits output. No task retry or provider fallback.
+          void handle.completion.catch(() => {});
+        } catch (error) {
+          // The worker never started, so no sub-worker exists; an unconfirmed close still is not settled.
+          const nestedError = await closeNested(nestedContext);
+          Object.assign(record, processFailure(error, provider));
+          record.status = 'failed';
+          record.settled = true;
+          record.error = error.message;
+          if (error.settled === false || nestedError) {
+            // A second layer that failed while being created hands back its own cleanup for a later retry.
+            const context = nestedError ? nestedContext : error.nestedCleanup;
+            if (context) nestedCleanups.set(requestId, {context, status: 'failed', settled: true});
+            record.status = 'unresolved';
+            record.settled = false;
+            if (nestedError) record.error += `；小工人停止狀態未確認：${nestedError.message}`;
+          }
+          processRuns.delete(requestId);
+          await persist(record);
+          changed(record);
+        }
+        return clone(record);
+      })()
+        .catch(error => {
+          processRuns.delete(requestId);
+          record.status = 'failed';
+          record.settled = true;
+          record.error = error.message;
+          Object.assign(record, processFailure(error, provider));
+          throw error;
+        })
+        .finally(() => operations.delete(requestId));
+      operations.set(requestId, operation);
+      return operation;
+    }
+  }
+  // A live process, a reused PID or a permission error all count as not gone.
+  const processGone = pid => {
+    if (!Number.isInteger(pid) || pid <= 0) return false;
+    try {
+      process.kill(pid, 0);
+      return false;
+    } catch (error) {
+      return error.code === 'ESRCH';
+    }
+  };
+  async function reconcile({requestId, summary, evidence}) {
+    if (!safeId(requestId)) throw new Error('requestId 格式無效。');
+    if (
+      typeof summary !== 'string' ||
+      !summary.trim() ||
+      summary.trim().length > 2000 ||
+      typeof evidence !== 'string' ||
+      !evidence.trim() ||
+      evidence.trim().length > 4000
+    )
+      throw new Error('請提供查核結論（1–2000 字）與實際核對證據及仍未知事項（1–4000 字）。');
+    if (closed || closing || operations.has(requestId)) throw new Error('工作正在操作或關閉；未寫入查核註記。');
+    const operation = (async () => {
+      const record = await load(requestId);
+      if (
+        !record ||
+        (!PROCESS_PROVIDERS.includes(record.provider) && record.provider !== 'codex') ||
+        record.executionUnowned !== true ||
+        record.settled !== false ||
+        ownedRequests.has(requestId) ||
+        processRuns.has(requestId)
+      )
+        throw new Error('只能核對本對話重啟後失去執行歸屬的子代理舊工單；不能代替停止或完成。');
+      const note = {summary: summary.trim(), evidence: evidence.trim()};
+      if (record.reconciliation?.summary === note.summary && record.reconciliation?.evidence === note.evidence)
+        return clone(record);
+      await persist(record, {reconciliation: {...note, reviewedAt: new Date().toISOString()}});
+      changed(record);
+      return clone(record);
+    })();
+    operations.set(requestId, operation);
+    try {
+      return await operation;
+    } finally {
+      if (operations.get(requestId) === operation) operations.delete(requestId);
+    }
+  }
+  async function cancel({requestId}) {
+    const activeRecord = records.get(requestId);
+    if (activeRecord && !activeRecord.settled && ownedRequests.has(requestId)) {
+      activeRecord.cancelRequested = true;
+      const run = processRuns.get(requestId);
+      run?.controller.abort();
+      if (questions.has(requestId)) {
+        // Revoke the parent's ability to answer immediately. A Codex tool
+        // stays pending until native interruption, resolution or host closure;
+        // replying with a tool error now would wake the turn we are stopping.
+        if (run) withdrawQuestion(activeRecord);
+        else delete activeRecord.pendingQuestion;
+        changed(activeRecord);
+      }
+    }
+    geminiOptions.accounts?.cancelWorkerHandoff?.({parentId, requestId});
+    if (handoffObservations.delete(requestId)) for (const wake of waiters.get(requestId) ?? []) wake();
+    for (let i = pendingHandoffs.length - 1; i >= 0; i--) {
+      const event = pendingHandoffs[i].event;
+      event.requestIds = event.requestIds.filter(id => id !== requestId);
+      if (!event.requestIds.length && !event.queryIds?.length) pendingHandoffs.splice(i, 1);
+    }
+    flushHandoff();
+    watch.forget(requestId);
+    const current = await inspect({requestId});
+    if (!current) return null;
+    const record = records.get(requestId);
+    if (PROCESS_PROVIDERS.includes(record.provider)) {
+      const handle = processRuns.get(requestId);
+      if (!record.settled && handle) {
+        record.cancelRequested = true;
+        handle.controller.abort();
+        await operations.get(requestId);
+        await handle.completion;
+      }
+      const cleanup = nestedCleanups.get(requestId);
+      if (cleanup && !processRuns.has(requestId) && !operations.has(requestId)) {
+        // The worker itself has ended; only its sub-workers' stop is retried. A failure throws and stays unresolved.
+        await cleanup.context.close();
+        nestedCleanups.delete(requestId);
+        record.status = cleanup.status;
+        record.settled = cleanup.settled;
+        record.error = `${record.error ?? ''} 小工人停止已於重試時確認。`.trim();
+        await persist(record);
+        changed(record);
+      } else if (
+        !handle &&
+        record.status === 'unresolved' &&
+        !record.settled &&
+        record.executionUnowned !== true &&
+        !operations.has(requestId) &&
+        processGone(record.pid)
+      ) {
+        // An earlier stop was unconfirmed. Once the worker's root process (agy or Claude Code) is gone, give up
+        // ownership as a K restart would: the outcome stays unresolved and is never replayed, but it no longer
+        // holds the room.
+        record.executionUnowned = true;
+        record.error = `${record.error ?? ''} 子代理主程序已確認結束；子程序與成果仍未確認，未重播。`.trim();
+        ownedRequests.delete(requestId);
+        await persist(record);
+        changed(record);
+      }
+      return inspect({requestId});
+    }
+    if (!record.settled) record.cancelRequested = true;
+    if (!record.threadId && !record.settled) {
+      record.status = 'cancelled';
+      record.settled = true;
+      await persist(record);
+      changed(record);
+    }
+    // An in-flight start sees cancelRequested and interrupts any turn it has just begun; let it finish
+    // before reading native state, so a turn starting after this read cannot follow a "cancelled" report.
+    // Bounded by the host request timeouts of thread/start and turn/start.
+    await operations.get(requestId)?.catch(() => {});
+    if (!record.threadId) return clone(record);
+    if (!host) throw Error('Codex 工人主控尚未連線；無法確認舊工作停止，未重播。');
+    const native = await host.request('thread/read', {threadId: record.threadId, includeTurns: true});
+    if (
+      native.thread?.id !== record.threadId ||
+      normalizeWorkspace(native.thread?.cwd) !== normalizeWorkspace(record.workspace ?? workspace)
+    )
+      throw new Error('Luna 原生工作歸屬無法確認，未中止或關閉主控。');
+    const active = native.thread.turns?.findLast(turn => turn.status === 'inProgress');
+    // History is readable without loading a thread. Terminal APIs only address
+    // loaded threads in this host; do not resume historical work just to close it.
+    if (native.thread.status?.type === 'notLoaded') {
+      const latest = native.thread.turns?.at(-1);
+      if (
+        active ||
+        !latest ||
+        latest.id !== record.turnId ||
+        !['completed', 'interrupted', 'failed'].includes(latest.status)
+      )
+        throw new Error(`Luna ${requestId} 的未載入工作尚無可確認的結束回合；未關閉主控。`);
+      extractThread(native.thread, record.workspace ?? workspace, record);
+      delete record.cleanupError;
+      await persist(record);
+      changed(record);
+      return clone(record);
+    }
+    if (active) await host.request('turn/interrupt', {threadId: record.threadId, turnId: active.id});
+    if (native.thread.status?.type === 'active' && !active)
+      throw new Error('Luna 原生執行狀態仍 active，無法確認停止。');
+    try {
+      await stopThreadTerminals(host, record.threadId);
+    } catch (error) {
+      // Cleanup failure is not evidence that the model's completed turn reverted.
+      record.cleanupError = `Luna ${requestId} 背景命令清理未確認：${error.message}`;
+      await persist(record).catch(() => {});
+      changed(record);
+      throw new Error(record.cleanupError, {cause: error});
+    }
+    delete record.cleanupError;
+    const result = await inspect({requestId});
+    if (!result?.settled) throw new Error('Luna 工作尚未確認停止；主控保持開啟，請先查詢原工作。');
+    return result;
+  }
+  async function close() {
+    if (closed) return;
+    if (closing) return closePromise;
+    closing = true;
+    watch.clear();
+    cancelGeminiHandoff();
+    closePromise = (async () => {
+      try {
+        const records = await bridgeList(false);
+        for (const record of records) {
+          // Historical Gemini records are not processes owned by this bridge.
+          // Leave their outcome unresolved; closing this host cannot settle them.
+          if (!record || record.executionUnowned === true) continue;
+          if (record.settled === true) {
+            // A completed turn may still own background terminals in THIS host.
+            // Historical settled records never trigger a native read or cancellation.
+            if (ownedThreads.has(record.threadId)) {
+              try {
+                await stopThreadTerminals(host, record.threadId);
+              } catch (error) {
+                record.cleanupError = `Luna ${record.requestId} 背景命令清理未確認：${error.message}`;
+                await persist(record);
+                throw Error(record.cleanupError, {cause: error});
+              }
+            }
+            continue;
+          }
+          const result = await cancel({requestId: record.requestId});
+          if (!result?.settled) throw new Error('Luna 工作尚未確認停止；Codex 主控保持開啟，請先查詢原工作。');
+        }
+        await host?.close();
+        closed = true;
+      } finally {
+        closing = false;
+        if (!closed) closePromise = null;
+      }
+    })();
+    return closePromise;
+  }
+  async function bridgeList(refresh = true) {
+    const ids = new Set(records.keys());
+    await mkdir(directory, {recursive: true});
+    const {readdir} = await import('node:fs/promises');
+    for (const name of await readdir(directory)) if (name.endsWith('.json')) ids.add(name.slice(0, -5));
+    return Promise.all([...ids].map(requestId => (refresh ? inspect({requestId}) : load(requestId))));
+  }
+  return {
+    start,
+    inspect,
+    answer,
+    cancel,
+    reconcile,
+    cancelGeminiHandoff,
+    workerPolicy: clone(defaults),
+    accounts: async () => {
+      if (closed || closing) throw Error('Luna bridge 正在關閉或已關閉。');
+      if (!geminiOptions.accounts && geminiOptions.officialGeminiAccount) {
+        const {auth, quota, installed, temporaryFailure, reason} = await geminiOptions.officialGeminiAccount.status();
+        return {mode: 'official', auth: auth?.status ?? 'unknown', quota: quota ?? {status: 'unavailable'},
+          installed, temporaryFailure, reason};
+      }
+      const epoch = handoffEpoch,
+        requestId = (accountQueryId ??= `account-query-${epoch}-${++querySequence}`);
+      const result = (await geminiOptions.accounts?.observe({
+        parentId,
+        requestId,
+        onHandoff: event => receiveHandoff(event, epoch),
+        handoffCurrent: () => !closed && !closing && epoch === handoffEpoch
+      })) ?? {
+        enabled: false,
+        accounts: [],
+        scheduling: {status: 'blocked', notificationRegistered: false, reason: '帳號排程未接通'}
+      };
+      if (closed || closing || epoch !== handoffEpoch) throw Error('來源已變更，未沿用舊帳號查詢的等待授權。');
+      if (result.scheduling?.status !== 'waiting' && accountQueryId === requestId) accountQueryId = null;
+      return result;
+    },
+    async wait({requestId, timeoutMs = geminiOnly ? null : 30000, signal}) {
+      if (timeoutMs !== null && (!Number.isFinite(timeoutMs) || timeoutMs < 0)) throw new Error('timeoutMs 無效。');
+      signal?.throwIfAborted();
+      const epoch = handoffEpoch;
+      const readSnapshot = async () => {
+        if (records.get(requestId)?.settled) {
+          await processRuns.get(requestId)?.completion;
+          // A settled record gets no further saves, so a failed last write would reject every wait forever.
+          // Retry that write once; if it fails again the error is still reported.
+          await persistTails.get(requestId)?.catch(() => persist(records.get(requestId)));
+        }
+        signal?.throwIfAborted();
+        if (epoch !== handoffEpoch || closed || closing)
+          throw Error('來源意圖或連線已變更，等待已取消；原工單未停止或重送。');
+        const record = snapshotRecord(records.get(requestId)),
+          scheduling = handoffObservations.get(requestId);
+        return scheduling
+          ? {
+              ...(record ?? {requestId, dispatch: 'not-started', status: 'not-started', settled: true}),
+              scheduling: clone(scheduling)
+            }
+          : record;
+      };
+      const snapshot = handoffObservations.has(requestId) ? await readSnapshot() : await inspect({requestId});
+      const schedulingWaiting = () => handoffObservations.get(requestId)?.status === 'waiting';
+      if (
+        timeoutMs === 0 ||
+        (!schedulingWaiting() &&
+          (!snapshot ||
+            snapshot.settled ||
+            snapshot.pendingQuestion ||
+            snapshot.executionUnowned ||
+            ['unresolved', 'failed'].includes(snapshot.status)))
+      )
+        return readSnapshot();
+      // A second wait acknowledges the already observed quiet episode instead
+      // of returning the same attention instantly and driving another goal turn.
+      const seenNotice = workerNeedsAttention(snapshot ?? {}) ? workerNoticeKey(snapshot) : null;
+      let seenApproval = snapshot?.waitingForApproval ?? 0;
+      // Subscribe before rechecking the record so a completion at the read/
+      // subscription boundary cannot be lost. Timeout only ends this wait.
+      return new Promise((resolve, reject) => {
+        let done = false,
+          timer;
+        const listeners = waiters.get(requestId) ?? new Set();
+        waiters.set(requestId, listeners);
+        const finish = error => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', abort);
+          listeners.delete(wake);
+          if (!listeners.size) waiters.delete(requestId);
+          if (error) reject(error);
+          else readSnapshot().then(resolve, reject);
+        };
+        const abort = () => finish(signal.reason ?? new Error('等待已取消；原工單未停止或重送。'));
+        const wake = () => {
+          if (epoch !== handoffEpoch || closed || closing)
+            return finish(new Error('來源意圖或連線已變更，等待已取消；原工單未停止或重送。'));
+          if (schedulingWaiting()) return;
+          const record = records.get(requestId);
+          const approval = record?.waitingForApproval ?? 0,
+            newApproval = approval > seenApproval;
+          seenApproval = approval;
+          if (
+            !record ||
+            record.settled ||
+            record.pendingQuestion ||
+            newApproval ||
+            (workerNeedsAttention(record) && workerNoticeKey(record) !== seenNotice)
+          )
+            finish();
+        };
+        if (timeoutMs !== null) timer = setTimeout(() => finish(), timeoutMs);
+        listeners.add(wake);
+        signal?.addEventListener('abort', abort, {once: true});
+        if (signal?.aborted) abort();
+        else wake();
+      });
+    },
+    list: bridgeList,
+    close
+  };
+}

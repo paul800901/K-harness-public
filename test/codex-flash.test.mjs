@@ -1,0 +1,1259 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp, mkdir, rm, writeFile} from 'node:fs/promises';
+import {fileURLToPath} from 'node:url';
+import path from 'node:path';
+import {createDesktopController} from '../src/desktop-controller.mjs';
+import {listMainSessions, saveMainSession} from '../src/main-sessions.mjs';
+import {MODEL_PROTOCOL_GUIDANCE} from '../src/worker-policy.mjs';
+import {CODEX_READING_GUIDANCE} from '../src/codex-reading.mjs';
+import {CODEX_CONTEXT_BYTES, commonMemoryPath, globalRulesPath} from '../src/common-memory.mjs';
+import {scratchBase} from './scratch.mjs';
+
+const fakeWorkerProvider = model =>
+  model?.startsWith('claude-') ? 'claude' : model?.startsWith('gpt-') ? 'codex' : 'gemini';
+
+async function fixture({
+  accessMode = 'workspace-write',
+  savedSession,
+  root: existingRoot,
+  workerPolicy = {model: 'gpt-6-luna', effort: 'high'},
+  cancelSettles = true,
+  unconfirmedNativeChild = false,
+  delayToolOutput = false,
+  rejectToolOutput = false,
+  onConversationSettled,
+  onChange,
+  selfHosted,
+  colabAdmin
+} = {}) {
+  const base = scratchBase;
+  await mkdir(base, {recursive: true});
+  const root = existingRoot ?? (await mkdtemp(path.join(base, 'codex-flash-')));
+  if (savedSession)
+    await saveMainSession(root, {
+      threadId: 'codex-parent',
+      model: 'gpt-6-astra',
+      workspace: root,
+      accessMode,
+      workerPolicy,
+      workerNotifications: {},
+      ...savedSession
+    });
+  const calls = [],
+    hostOptions = [],
+    hosts = [],
+    gatewayOptions = [],
+    bridgeOptions = [],
+    workerRecords = new Map(),
+    workerOperations = [];
+  let hostCloseCount = 0,
+    gatewayCloseCount = 0,
+    bridgeCloseCount = 0,
+    nativeChildUnconfirmed = unconfirmedNativeChild,
+    resolveToolOutput,
+    releaseToolOutput;
+  const toolOutputSent = new Promise(resolve => {
+      resolveToolOutput = resolve;
+    }),
+    toolOutputGate = new Promise(resolve => {
+      releaseToolOutput = resolve;
+    });
+  const newHost = options => {
+    let onHostClose,
+      droppedTurn = false,
+      recoveredInterrupted = false;
+    const host = {
+      closed: new Promise(resolve => {
+        onHostClose = resolve;
+      }),
+      notify() {},
+      waitForMcp: async () => {},
+      close: async () => {
+        if (options.onEvent) hostCloseCount++;
+        onHostClose();
+      },
+      request: async (method, params) => {
+        calls.push({method, params});
+        if (method === 'account/read') return {account: {type: 'chatgpt'}};
+        if (method === 'model/list')
+          return {
+            data: [
+              {
+                model: 'gpt-6-astra',
+                displayName: 'GPT-6 Astra',
+                hidden: false,
+                supportedReasoningEfforts: [{reasoningEffort: 'high'}],
+                defaultReasoningEffort: 'high',
+                inputModalities: ['text']
+              },
+              {
+                model: 'gpt-6-luna',
+                displayName: 'GPT-6 Luna',
+                hidden: false,
+                supportedReasoningEfforts: [{reasoningEffort: 'high'}],
+                defaultReasoningEffort: 'high',
+                inputModalities: ['text']
+              }
+            ],
+            nextCursor: null
+          };
+        if (method === 'thread/start' || method === 'thread/resume')
+          return {thread: {id: params.threadId ?? 'codex-parent'}};
+        if (method === 'thread/read' && droppedTurn && !recoveredInterrupted)
+          return {
+            thread: {
+              id: params.threadId,
+              status: {type: 'active'},
+              turns: [{id: 'unconfirmed-completion-turn', status: 'inProgress', items: []}]
+            }
+          };
+        if (method === 'thread/read')
+          return params.threadId === 'child-gpt'
+            ? {
+                thread: {
+                  id: 'child-gpt',
+                  parentThreadId: 'codex-parent',
+                  cwd: root,
+                  status: {type: nativeChildUnconfirmed ? 'active' : 'idle'},
+                  turns: [{id: 'child-turn', status: nativeChildUnconfirmed ? 'inProgress' : 'completed', items: []}]
+                }
+              }
+            : {thread: {id: params.threadId, cwd: root, status: {type: 'idle'}, turns: []}};
+        if (method === 'thread/backgroundTerminals/list') return {data: [], nextCursor: null};
+        if (method === 'windowsSandbox/readiness') return {status: 'ready'};
+        if (method === 'turn/start' && params.toolOutput) {
+          resolveToolOutput(params);
+          if (delayToolOutput) await toolOutputGate;
+          if (rejectToolOutput) {
+            droppedTurn = true;
+            throw new Error('fixture transport dropped after send');
+          }
+          return {turn: {id: `turn-${calls.filter(x => x.method === 'turn/start').length}`}};
+        }
+        if (method === 'turn/start') return {turn: {id: `turn-${calls.filter(x => x.method === 'turn/start').length}`}};
+        if (method === 'turn/interrupt') {
+          recoveredInterrupted = true;
+          return {};
+        }
+        if (method === 'account/rateLimits/read') return {};
+        return {};
+      }
+    };
+    hosts.push(host);
+    hostOptions.push(options);
+    return host;
+  };
+  const c = createDesktopController({
+    root,
+    selfHosted,
+    colabAdmin,
+    executable: 'fixture-codex',
+    onConversationSettled,
+    onChange,
+    hostFactory: newHost,
+    workerPolicy,
+    bridgeFactory: async options => {
+      bridgeOptions.push(options);
+      return {
+        start: async args => {
+          workerOperations.push(['start', args.requestId]);
+          const record = {
+            requestId: args.requestId,
+            provider: fakeWorkerProvider(args.model),
+            parentId: options.parentId,
+            workspace: options.workspace,
+            status: 'running',
+            settled: false,
+            output: '',
+            ...args
+          };
+          workerRecords.set(args.requestId, record);
+          options.onChange(record);
+          return structuredClone(record);
+        },
+        list: async includeSettled => {
+          workerOperations.push(['list', includeSettled]);
+          return [...workerRecords.values()].map(record => structuredClone(record));
+        },
+        inspect: async ({requestId}) => {
+          workerOperations.push(['inspect', requestId]);
+          return workerRecords.has(requestId) ? structuredClone(workerRecords.get(requestId)) : null;
+        },
+        wait: async ({requestId}) => {
+          workerOperations.push(['wait', requestId]);
+          return workerRecords.has(requestId) ? structuredClone(workerRecords.get(requestId)) : null;
+        },
+        cancel: async ({requestId}) => {
+          workerOperations.push(['cancel', requestId]);
+          const record = workerRecords.get(requestId);
+          if (record && cancelSettles) {
+            record.status = 'cancelled';
+            record.settled = true;
+            options.onChange(record);
+          }
+          return record ? structuredClone(record) : null;
+        },
+        accounts: async () => ({
+          enabled: true,
+          accounts: [{accountId: 'fixture-account', checkedAt: '2026-10-03T00:00:00Z'}]
+        }),
+        close: async () => {
+          bridgeCloseCount++;
+        }
+      };
+    },
+    gatewayFactory: async options => {
+      gatewayOptions.push(options);
+      return {
+        mcpConfig: {
+          mcpServers: {
+            k_gemini: {
+              type: 'http',
+              url: `http://127.0.0.1:${43209 + gatewayOptions.length}/mcp`,
+              headers: {Authorization: 'Bearer fixture-token'}
+            }
+          }
+        },
+        close: async () => {
+          gatewayCloseCount++;
+          await options.bridge.close?.();
+        }
+      };
+    }
+  });
+  return {
+    c,
+    root,
+    calls,
+    get host() {
+      return hosts.at(-1);
+    },
+    hostOptions,
+    gatewayOptions,
+    bridgeOptions,
+    workerRecords,
+    workerOperations,
+    toolOutputSent,
+    releaseToolOutput,
+    get hostCloseCount() {
+      return hostCloseCount;
+    },
+    get gatewayCloseCount() {
+      return gatewayCloseCount;
+    },
+    get bridgeCloseCount() {
+      return bridgeCloseCount;
+    },
+    setNativeChildUnconfirmed(value) {
+      nativeChildUnconfirmed = value;
+    }
+  };
+}
+
+test('Colab admin is reachable from the working main only, without a self-hosted model', async () => {
+  const seen = [];
+  const f = await fixture({colabAdmin: {status: async args => (seen.push(args), {runtime: {state: 'unconfigured'}})}});
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    await f.c.send({text: 'read Colab status'});
+    const entry = f.gatewayOptions[0].colab;
+    assert.equal(entry.stop, undefined);
+    await assert.rejects(async () =>
+      entry.status({live: true}, {'x-codex-turn-metadata': {thread_id: 'other', turn_id: 'turn-1'}})
+    );
+    await assert.rejects(async () => entry.login({'x-codex-turn-metadata': {thread_id: 'other', turn_id: 'turn-1'}}));
+    await entry.status({live: true}, {'x-codex-turn-metadata': {thread_id: 'codex-parent', turn_id: 'turn-1'}});
+    await entry.login({'x-codex-turn-metadata': {thread_id: 'codex-parent', turn_id: 'turn-1'}});
+    assert.deepEqual(seen, [{live: true}, {signIn: true}]);
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('Colab native holders release only their terminal turn, including host loss and close', async () => {
+  for (const outcome of ['completed', 'host-loss', 'close']) {
+    const released = [],
+      stops = [];
+    const model = 'gemma-local/gemma-4-12b-it-qat';
+    const f = await fixture({
+      selfHosted: {
+        models: async () => ({models: [{model, available: true}]}),
+        prepare: async () => {},
+        nativeModel: () => 'm',
+        colabTools: {release: who => released.push(who), status: async () => ({}), stop: async who => stops.push(who)}
+      }
+    });
+    try {
+      await f.c.open({model});
+      await f.c.send({text: 'work'});
+      const event = f.hostOptions.at(-1).onEvent;
+      event({method: 'turn/started', params: {threadId: 'codex-parent', turn: {id: 'turn-1'}}});
+      await f.gatewayOptions[0].colab.stop({'x-codex-turn-metadata': {thread_id: 'codex-parent', turn_id: 'turn-1'}});
+      assert.deepEqual(stops, [{thread: 'codex-parent', turn: 'turn-1'}]);
+      event({method: 'turn/completed', params: {threadId: 'other', turn: {id: 'turn-1', status: 'completed'}}});
+      event({method: 'turn/completed', params: {threadId: 'codex-parent', turn: {id: 'old', status: 'completed'}}});
+      assert.deepEqual(released, []);
+      if (outcome === 'completed')
+        event({
+          method: 'turn/completed',
+          params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+        });
+      else if (outcome === 'host-loss') {
+        await f.host.close();
+        await new Promise(r => setImmediate(r));
+      } else await f.c.close();
+      assert.deepEqual(released, [{thread: 'codex-parent', turn: 'turn-1'}]);
+    } finally {
+      await f.c.close();
+    }
+  }
+});
+
+test('Codex thread gets only the Flash HTTP gateway; native GPT agents remain unchanged', async () => {
+  const f = await fixture();
+  try {
+    await f.c.open({model: 'gpt-6-astra', workerPolicy: {model: 'gpt-6-luna', effort: 'high'}});
+    const {config, developerInstructions} = f.calls.find(x => x.method === 'thread/start').params;
+    assert.ok(developerInstructions.includes(CODEX_READING_GUIDANCE));
+    assert.ok(developerInstructions.includes(MODEL_PROTOCOL_GUIDANCE));
+    const englishAccounts = developerInstructions.split('\n').find(line =>
+      line.startsWith('Use the existing Codex subscription.')
+    );
+    assert.match(englishAccounts, /current official Antigravity login/);
+    assert.match(englishAccounts, /Omit accountId/);
+    assert.match(englishAccounts, /native goal is active and no independent work remains, use gemini_wait .*timeoutMs=null/);
+    assert.deepEqual(config.mcp_servers.k_gemini, {
+      url: 'http://127.0.0.1:43210/mcp',
+      http_headers: {Authorization: 'Bearer fixture-token'},
+      tool_timeout_sec: 86400
+    });
+    assert.equal(config.mcp_servers.k_luna, undefined);
+    assert.equal(config.mcp_servers.k_flash.enabled, false);
+    assert.equal(config.agents.default_subagent_model, 'gpt-6-luna');
+    assert.equal(config.agents.default_subagent_reasoning_effort, 'high');
+    assert.doesNotMatch(
+      JSON.stringify(config.agents),
+      /claude-/,
+      'native GPT defaults must not be populated with Claude models'
+    );
+    assert.equal(f.gatewayOptions[0].geminiOnly, true);
+    assert.equal(f.bridgeOptions.length, 0, 'bridge is lazy until a Flash tool is called');
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('Gemma main delivers a bridge Codex worker result as bridge content and preserves the local model route', async () => {
+  const localModel = 'gemma-local/gemma-4-12b-it-qat';
+  const f = await fixture({
+    selfHosted: {
+      models: async () => ({models: [{model: localModel, displayName: 'Gemma', available: true}]}),
+      prepare: async () => {},
+      nativeModel: () => 'gemma-4-12b-it-qat'
+    }
+  });
+  try {
+    await f.c.open({model: localModel});
+    await f.c.send({text: '派一個 GPT 工人'});
+    const bridge = f.gatewayOptions[0].bridge;
+    await bridge.start({requestId: 'gemma-gpt-result', model: 'gpt-6-luna', effort: 'high', task: '完成工作'});
+    const record = f.workerRecords.get('gemma-gpt-result');
+    Object.assign(record, {status: 'completed', settled: true, output: 'GPT 工人的實際輸出'});
+    f.bridgeOptions[0].onChange(record);
+    f.hostOptions.at(-1).onEvent({
+      method: 'turn/completed',
+      params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+    });
+    await f.toolOutputSent;
+    await new Promise(resolve => setImmediate(resolve));
+    const delivery = f.calls.find(call => call.method === 'turn/start' && call.params.toolOutput);
+    assert.ok(delivery);
+    assert.equal(delivery.params.model, 'gemma-4-12b-it-qat');
+    assert.equal(delivery.params.toolOutput.name, 'gemini_start');
+    assert.match(delivery.params.toolOutput.output, /GPT 工人的實際輸出/);
+    assert.doesNotMatch(delivery.params.toolOutput.output, /原生子代理終止不等於交付成功/);
+    await f.c.close();
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('Gemma stop cancels and verifies an unsettled bridge Codex worker before closing the bridge', async () => {
+  const localModel = 'gemma-local/gemma-4-12b-it-qat';
+  const f = await fixture({
+    selfHosted: {
+      models: async () => ({models: [{model: localModel, displayName: 'Gemma', available: true}]}),
+      prepare: async () => {},
+      nativeModel: () => 'gemma-4-12b-it-qat'
+    }
+  });
+  try {
+    await f.c.open({model: localModel});
+    const bridge = f.gatewayOptions[0].bridge;
+    await bridge.start({requestId: 'gemma-gpt-stop', model: 'gpt-6-luna', effort: 'high', task: '長工單'});
+    await f.c.stop();
+    assert.ok(f.workerOperations.some(([op, id]) => op === 'cancel' && id === 'gemma-gpt-stop'));
+    assert.ok(f.workerOperations.some(([op, id]) => op === 'wait' && id === 'gemma-gpt-stop'));
+    assert.ok(f.workerOperations.some(([op, id]) => op === 'inspect' && id === 'gemma-gpt-stop'));
+    assert.equal(f.bridgeCloseCount, 1);
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('unconfirmed native Codex child still blocks stop before bridge cancellation', async () => {
+  const f = await fixture({unconfirmedNativeChild: true});
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    f.hostOptions.at(-1).onEvent({
+      method: 'item/started',
+      params: {
+        threadId: 'codex-parent',
+        turnId: 'turn-parent',
+        item: {id: 'native-child', type: 'subAgentActivity', kind: 'started', agentThreadId: 'child-gpt'}
+      }
+    });
+    await assert.rejects(f.c.stop(), /子代理尚未確認停止/);
+    assert.equal(f.bridgeCloseCount, 0);
+    f.setNativeChildUnconfirmed(false);
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('Flash dispatch retains account and handoff fields and is owned by its native parent thread', async () => {
+  const f = await fixture();
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    const gateway = f.gatewayOptions[0],
+      bridge = gateway.bridge;
+    const args = {
+      requestId: 'flash-request-1',
+      model: 'gemini-3.8-flash',
+      effort: 'medium',
+      accountId: 'a'.repeat(32),
+      handoffFrom: 'flash-request-previous',
+      task: '只完成剩餘核對'
+    };
+    const started = await bridge.start(args);
+    assert.equal(started.parentId, 'codex-parent');
+    assert.equal(started.accountId, args.accountId);
+    assert.equal(started.handoffFrom, args.handoffFrom);
+    assert.equal(f.bridgeOptions[0].workspace, f.root);
+    assert.equal(f.bridgeOptions[0].accessMode, 'workspace-write');
+    assert.equal(f.bridgeOptions[0].parentId, 'codex-parent');
+    assert.equal(f.bridgeOptions[0].geminiOnly, true);
+    assert.deepEqual(await bridge.accounts(), {
+      enabled: true,
+      accounts: [{accountId: 'fixture-account', checkedAt: '2026-10-03T00:00:00Z'}]
+    });
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('stopping closes the thread-bound Flash bridge while retaining the host gateway for the next send', async () => {
+  const f = await fixture();
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    const first = f.calls.find(call => call.method === 'thread/start').params.config.mcp_servers.k_gemini.url;
+    await f.c.send({text: '先做一回合'});
+    const bridge = f.gatewayOptions[0].bridge;
+    await bridge.start({requestId: 'stop-close-bridge', model: 'gemini-3.8-flash', effort: 'low', task: '停止前工人'});
+    const old = {
+      requestId: 'old-unowned-unresolved',
+      provider: 'gemini',
+      parentId: 'codex-parent',
+      status: 'unresolved',
+      settled: false,
+      executionUnowned: true
+    };
+    f.workerRecords.set(old.requestId, structuredClone(old));
+    assert.equal(
+      (await bridge.list()).find(record => record.requestId === old.requestId).executionUnowned,
+      true,
+      'list reloads the old unowned record'
+    );
+    await f.c.stop();
+    assert.equal(f.gatewayCloseCount, 0);
+    assert.equal(f.bridgeCloseCount, 1);
+    assert.equal(f.workerRecords.get('stop-close-bridge').settled, true);
+    assert.deepEqual(f.workerRecords.get(old.requestId), old, 'stopping leaves the historical record unchanged');
+    assert.equal(
+      f.workerOperations.filter(([operation]) => operation === 'start').length,
+      1,
+      'stop does not dispatch another worker'
+    );
+    assert.equal(
+      f.workerOperations.some(([operation, id]) => operation === 'cancel' && id === old.requestId),
+      false,
+      'never cancel the old unowned request'
+    );
+    for (const operation of ['cancel', 'wait', 'inspect'])
+      assert.ok(
+        f.workerOperations.some(([name, id]) => name === operation && id === 'stop-close-bridge'),
+        `owned work still uses ${operation} verification`
+      );
+    await f.c.send({text: '停止後接續'});
+    assert.equal(f.gatewayOptions.length, 1);
+    assert.equal(f.calls.find(call => call.method === 'thread/start').params.config.mcp_servers.k_gemini.url, first);
+    assert.ok(f.c.state.threadId);
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('closing after loading only old unowned Flash work does not cancel or settle it', async () => {
+  const f = await fixture();
+  await f.c.open({model: 'gpt-6-astra'});
+  const old = {
+    requestId: 'old-unowned-close',
+    provider: 'gemini',
+    parentId: 'codex-parent',
+    status: 'unresolved',
+    settled: false,
+    executionUnowned: true
+  };
+  f.workerRecords.set(old.requestId, structuredClone(old));
+  const bridge = f.gatewayOptions[0].bridge;
+  assert.equal((await bridge.list()).length, 1);
+  await f.c.close();
+  assert.deepEqual(f.workerRecords.get(old.requestId), old);
+  assert.equal(
+    f.workerOperations.some(([operation, id]) => operation === 'cancel' && id === old.requestId),
+    false
+  );
+  assert.equal(
+    f.workerOperations.some(([operation]) => operation === 'start'),
+    false,
+    'close does not dispatch another worker'
+  );
+  assert.equal(f.bridgeCloseCount, 1);
+  assert.equal(f.gatewayCloseCount, 1);
+});
+
+test('Flash rows coexist with native GPT rows; permission changes confirm stop and recreate bridge in bounded mode', async () => {
+  const f = await fixture();
+  try {
+    await f.c.open({model: 'gpt-6-astra', accessMode: 'auto-review', permissionConfirmed: true});
+    const bridge = f.gatewayOptions[0].bridge;
+    await bridge.start({
+      requestId: 'permission-switch-flash',
+      model: 'gemini-3.8-flash',
+      effort: 'medium',
+      task: '小任務'
+    });
+    f.hostOptions.at(-1).onEvent({
+      method: 'item/started',
+      params: {
+        threadId: 'codex-parent',
+        turnId: 'turn-parent',
+        item: {id: 'native-child', type: 'subAgentActivity', kind: 'started', agentThreadId: 'child-gpt'}
+      }
+    });
+    const rows = await f.c.workers();
+    assert.deepEqual(new Set(rows.map(row => row.provider)), new Set(['codex', 'gemini']));
+    assert.equal(f.bridgeOptions[0].accessMode, 'workspace-write', 'auto-review must not become elevated Flash access');
+    await f.c.send({text: '以唯讀模式接續', accessMode: 'read-only'});
+    assert.equal(f.gatewayCloseCount, 0);
+    assert.equal(f.bridgeCloseCount, 1);
+    assert.equal(f.workerRecords.get('permission-switch-flash').settled, true);
+    assert.equal(f.c.state.accessMode, 'read-only');
+    const config = f.calls.findLast(call => call.method === 'thread/start').params;
+    assert.equal(config.sandbox, 'read-only');
+  } finally {
+    await f.c.close();
+  }
+});
+
+for (const [provider, model] of [
+  ['gemini', 'gemini-3.8-flash'],
+  ['claude', 'claude-opus-5-5']
+])
+  test(`GPT to ${provider} result returns once to the original chat and is not replayed on reopen`, async () => {
+    const f = await fixture();
+    try {
+      await f.c.open({model: 'gpt-6-astra'});
+      await f.c.send({text: '處理一個 Flash 子任務'});
+      const gateway = f.gatewayOptions[0],
+        bridge = gateway.bridge;
+      await bridge.start({requestId: 'flash-in-turn', model, effort: 'low', task: '完成'});
+      let record = f.workerRecords.get('flash-in-turn');
+      record.status = 'completed';
+      record.settled = true;
+      record.output = '已完成';
+      bridgeOptionsCallback(f, record);
+      bridge.resultReady({requestId: 'flash-in-turn'}, {settled: false});
+      f.hostOptions.at(-1).onEvent({
+        method: 'turn/completed',
+        params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+      });
+      await f.toolOutputSent;
+      await new Promise(resolve => setImmediate(resolve));
+      const output = f.calls.find(x => x.method === 'turn/start' && x.params.toolOutput);
+      assert.ok(output);
+      assert.equal(output.params.threadId, 'codex-parent');
+      assert.deepEqual(output.params.input, []);
+      assert.equal(output.params.toolOutput.name, 'gemini_start');
+      assert.equal(output.params.toolOutput.namespace, null);
+      assert.match(output.params.toolOutput.output, /已完成/);
+      assert.deepEqual(output.params.sandboxPolicy, {
+        type: 'workspaceWrite',
+        writableRoots: [f.root],
+        networkAccess: false,
+        excludeTmpdirEnvVar: true,
+        excludeSlashTmp: true
+      });
+      assert.equal(f.c.state.notices.at(-1).kind, 'worker-completion');
+      const saved = (await listMainSessions(f.root)).sessions.find(item => item.threadId === 'codex-parent');
+      assert.deepEqual(saved.workerNotifications, {'flash-in-turn': 'delivery-attempted'});
+      await f.c.close();
+      const reopened = await fixture({root: f.root});
+      try {
+        await reopened.c.open({model: 'gpt-6-astra', threadId: 'codex-parent'});
+        await reopened.c.send({text: '繼續原任務'});
+        const reopenedBridge = reopened.gatewayOptions[0].bridge;
+        await reopenedBridge.start({requestId: 'flash-in-turn', model, effort: 'low', task: '既有完成工作'});
+        const oldRecord = reopened.workerRecords.get('flash-in-turn');
+        oldRecord.status = 'completed';
+        oldRecord.settled = true;
+        reopened.bridgeOptions[0].onChange(oldRecord);
+        reopenedBridge.resultReady({requestId: 'flash-in-turn'}, {settled: false});
+        reopened.hostOptions.at(-1).onEvent({
+          method: 'turn/completed',
+          params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+        });
+        await reopened.c.workers();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(
+          reopened.calls.some(call => call.method === 'turn/start' && call.params.toolOutput),
+          false,
+          'reopening must not replay an attempted notification'
+        );
+      } finally {
+        await reopened.c.close();
+      }
+    } finally {
+      await f.c.close();
+    }
+  });
+
+test('settled Flash result returned to the model is disarmed and not re-notified', async () => {
+  const f = await fixture();
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    await f.c.send({text: '派一個 Flash 工作'});
+    const bridge = f.gatewayOptions[0].bridge;
+    const result = await bridge.start({
+      requestId: 'already-returned',
+      model: 'gemini-3.8-flash',
+      effort: 'high',
+      task: '完成'
+    });
+    result.status = 'completed';
+    result.settled = true;
+    result.output = '模型已取得的結果';
+    f.workerRecords.set(result.requestId, result);
+    bridge.resultReady({requestId: result.requestId}, {settled: true});
+    f.hostOptions.at(-1).onEvent({
+      method: 'turn/completed',
+      params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(
+      f.calls.some(x => x.method === 'turn/start' && x.params.toolOutput),
+      false
+    );
+  } finally {
+    await f.c.close();
+  }
+});
+
+for (const status of ['failed', 'unresolved'])
+  test(`unsettled ${status} Flash observation gets one status notice before its final completion`, async () => {
+    const f = await fixture();
+    try {
+      await f.c.open({model: 'gpt-6-astra'});
+      await f.c.send({text: 'fake parent work'});
+      const bridge = f.gatewayOptions[0].bridge;
+      await bridge.start({
+        requestId: `${status}-notice`,
+        model: 'gemini-3.8-flash',
+        effort: 'low',
+        task: 'fake worker'
+      });
+      const record = f.workerRecords.get(`${status}-notice`);
+      record.status = status;
+      record.settled = false;
+      f.bridgeOptions[0].onChange(record);
+      f.bridgeOptions[0].onChange(record);
+      f.hostOptions.at(-1).onEvent({
+        method: 'turn/completed',
+        params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+      });
+      const outputs = () => f.calls.filter(call => call.method === 'turn/start' && call.params.toolOutput);
+      for (let i = 0; i < 100 && outputs().length < 1; i++) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(outputs().length, 1);
+      assert.match(outputs()[0].params.toolOutput.output, /K 子代理狀態通知/);
+      assert.match(outputs()[0].params.toolOutput.output, /不是完成通知/);
+      assert.doesNotMatch(outputs()[0].params.toolOutput.output, /K 工人完成通知/);
+      assert.equal(f.c.state.notices.at(-1).kind, 'worker-attention');
+      f.bridgeOptions[0].onChange(record);
+      f.bridgeOptions[0].onChange(record);
+      f.hostOptions.at(-1).onEvent({
+        method: 'turn/completed',
+        params: {threadId: 'codex-parent', turn: {id: 'turn-2', status: 'completed'}}
+      });
+      await new Promise(resolve => setTimeout(resolve, 30));
+      assert.equal(outputs().length, 1, 'repeated unknown status does not wake Codex again');
+      record.status = 'completed';
+      record.settled = true;
+      record.output = 'fake done';
+      f.bridgeOptions[0].onChange(record);
+      for (let i = 0; i < 100 && outputs().length < 2; i++) await new Promise(resolve => setTimeout(resolve, 10));
+      assert.equal(outputs().length, 2);
+      assert.match(outputs()[1].params.toolOutput.output, /K 工人完成通知/);
+      assert.equal(f.c.state.notices.at(-1).kind, 'worker-completion');
+      f.bridgeOptions[0].onChange(record);
+      await new Promise(resolve => setTimeout(resolve, 30));
+      assert.equal(outputs().length, 2, 'settled completion is delivered exactly once');
+    } finally {
+      await f.c.close();
+    }
+  });
+
+test('stop waits for an in-flight completion toolOutput, then interrupts its confirmed native turn', async () => {
+  const f = await fixture({delayToolOutput: true});
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    await f.c.send({text: '先做一回合'});
+    const bridge = f.gatewayOptions[0].bridge;
+    await bridge.start({requestId: 'delayed-output', model: 'gemini-3.8-flash', effort: 'low', task: '完成'});
+    const record = f.workerRecords.get('delayed-output');
+    record.status = 'completed';
+    record.settled = true;
+    record.output = 'done';
+    f.bridgeOptions[0].onChange(record);
+    f.hostOptions.at(-1).onEvent({
+      method: 'turn/completed',
+      params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+    });
+    await f.toolOutputSent;
+    let stopped = false;
+    const stopping = f.c.stop().then(
+      () => {
+        stopped = true;
+      },
+      () => {
+        stopped = true;
+      }
+    );
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(stopped, false, 'stop must wait instead of assuming no completion turn exists');
+    f.releaseToolOutput();
+    await stopping;
+    assert.ok(f.calls.some(call => call.method === 'turn/interrupt' && call.params.turnId === 'turn-2'));
+    assert.equal(f.c.state.status, 'interrupted');
+  } finally {
+    f.releaseToolOutput();
+    await f.c.close();
+  }
+});
+
+test('uncertain completion is never replayed and does not permanently lock the native host', async () => {
+  const f = await fixture({rejectToolOutput: true});
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    await f.c.send({text: '完成後需查明原生回合'});
+    const bridge = f.gatewayOptions[0].bridge;
+    await bridge.start({requestId: 'uncertain-delivery', model: 'gemini-3.8-flash', effort: 'low', task: '完成'});
+    const record = f.workerRecords.get('uncertain-delivery');
+    record.status = 'completed';
+    record.settled = true;
+    record.output = 'done';
+    f.bridgeOptions[0].onChange(record);
+    f.hostOptions.at(-1).onEvent({
+      method: 'turn/completed',
+      params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+    });
+    await f.toolOutputSent;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.c.state.status, 'uncertain');
+    await assert.rejects(f.c.open({model: 'gpt-6-astra', threadId: 'codex-parent'}), /先按停止/);
+    await f.c.stop();
+    assert.ok(f.calls.some(call => call.method === 'thread/read' && call.params.threadId === 'codex-parent'));
+    assert.equal(f.c.state.status, 'interrupted');
+    await f.c.close();
+    const reopened = await fixture({root: f.root});
+    try {
+      await reopened.c.open({model: 'gpt-6-astra', threadId: 'codex-parent'});
+      await reopened.c.send({text: '原工作查明後可恢復'});
+      assert.equal(
+        reopened.calls.some(call => call.method === 'turn/start' && call.params.toolOutput),
+        false
+      );
+    } finally {
+      await reopened.c.close();
+    }
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('Flash stop must be confirmed before gateway or host closes', async () => {
+  const f = await fixture({cancelSettles: false});
+  await f.c.open({model: 'gpt-6-astra'});
+  const bridge = f.gatewayOptions[0].bridge;
+  await bridge.start({requestId: 'uncertain-flash', model: 'gemini-3.8-flash', effort: 'low', task: '長工作'});
+  await assert.rejects(f.c.close(), /停止狀態未確認/);
+  assert.equal(f.gatewayCloseCount, 0);
+  assert.equal(f.hostCloseCount, 0);
+});
+
+test('Codex native approval still uses the original one-shot approval handler', async () => {
+  const f = await fixture();
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    await f.c.send({text: '原生核准測試'});
+    const pending = f.hostOptions.at(-1).onRequest({
+      id: 44,
+      method: 'item/commandExecution/requestApproval',
+      params: {threadId: 'codex-parent', turnId: 'turn-1', command: 'node fixture.js', cwd: f.root}
+    });
+    const question = f.c.state.questions.at(-1);
+    assert.equal(question.kind, 'approval');
+    assert.equal(question.details.command, 'node fixture.js');
+    f.c.answer({id: question.id, accept: true});
+    assert.deepEqual(await pending, {decision: 'accept'});
+  } finally {
+    await f.c.close();
+  }
+});
+
+function bridgeOptionsCallback(f, record) {
+  f.bridgeOptions[0].onChange(record);
+}
+
+test('failed completion submission during stop is read back before a second stop can succeed', async () => {
+  const f = await fixture({delayToolOutput: true, rejectToolOutput: true});
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    await f.c.send({text: '停止時查明結果'});
+    const bridge = f.gatewayOptions[0].bridge;
+    await bridge.start({requestId: 'stop-unknown', model: 'gemini-3.8-flash', effort: 'low', task: '完成'});
+    const record = f.workerRecords.get('stop-unknown');
+    record.status = 'completed';
+    record.settled = true;
+    record.output = 'done';
+    f.bridgeOptions[0].onChange(record);
+    f.hostOptions.at(-1).onEvent({
+      method: 'turn/completed',
+      params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+    });
+    await f.toolOutputSent;
+    const firstStop = assert.rejects(f.c.stop(), /fixture transport dropped/);
+    f.releaseToolOutput();
+    await firstStop;
+    await f.c.stop();
+    assert.ok(
+      f.calls.some(call => call.method === 'turn/interrupt' && call.params.turnId === 'unconfirmed-completion-turn'),
+      'stop must inspect and interrupt the original uncertain turn, not assume it stopped'
+    );
+    assert.equal(f.calls.filter(call => call.method === 'turn/start' && call.params.toolOutput).length, 1);
+    assert.equal(f.c.state.status, 'interrupted');
+  } finally {
+    f.releaseToolOutput();
+    await f.c.close();
+  }
+});
+
+for (const outcome of ['completed', 'failed', 'transport-unknown', 'no-new-completion', 'gemini-ready'])
+  test(`native completion during rejected notification cleanup: ${outcome}`, {timeout: 15000}, async () => {
+    let enter,
+      release,
+      settle,
+      finishCleanup,
+      rejecting = false;
+    const entered = new Promise(resolve => (enter = resolve)),
+      gate = new Promise(resolve => (release = resolve)),
+      settled = new Promise(resolve => (settle = resolve)),
+      cleanup = new Promise(resolve => (finishCleanup = resolve));
+    const f = await fixture({
+      onConversationSettled: event => {
+        if (event.turnId === 'native-goal-turn') settle();
+      },
+      onChange: () => {
+        if (rejecting) finishCleanup();
+      }
+    });
+    try {
+      await f.c.open({model: 'gpt-6-astra'});
+      await f.c.send({text: 'native completion during notification cleanup'});
+      const emit = f.hostOptions.at(-1).onEvent;
+      f.c.state.goal = {status: 'active'};
+      const original = f.host.request;
+      let attempts = 0;
+      f.host.request = async (method, params, ...rest) => {
+        if (outcome === 'gemini-ready' && method === 'thread/loaded/list') return {data: ['codex-parent']};
+        if (method === 'turn/start' && params.toolOutput && ++attempts === 1) {
+          emit({method: 'turn/started', params: {threadId: 'codex-parent', turn: {id: 'native-goal-turn'}}});
+          enter();
+          await gate;
+          rejecting = true;
+          throw Object.assign(
+            Error('native notification rejected'),
+            outcome === 'transport-unknown' ? {} : {protocolMessage: {code: -32600}}
+          );
+        }
+        return original(method, params, ...rest);
+      };
+      await f.gatewayOptions[0].bridge.start({
+        requestId: 'goal-worker',
+        model: 'gemini-3.8-flash',
+        effort: 'low',
+        task: 'fake'
+      });
+      const record = f.workerRecords.get('goal-worker');
+      Object.assign(record, {status: 'completed', settled: true, output: 'done'});
+      f.bridgeOptions[0].onChange(record);
+      if (outcome === 'gemini-ready')
+        f.bridgeOptions[0].onGeminiHandoff({
+          parentId: 'codex-parent',
+          status: 'ready',
+          requestIds: [],
+          queryIds: ['quota-query']
+        });
+      emit({method: 'turn/completed', params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}});
+      await entered;
+      emit({
+        method: 'turn/completed',
+        params: {
+          threadId: 'codex-parent',
+          turn: {
+            id: outcome === 'no-new-completion' ? 'foreign-turn' : 'native-goal-turn',
+            status: outcome === 'failed' ? 'failed' : 'completed'
+          }
+        }
+      });
+      if (outcome !== 'no-new-completion') await settled;
+      assert.equal(attempts, 1);
+      release();
+      await cleanup;
+      if (outcome === 'transport-unknown' || outcome === 'failed') {
+        assert.equal(attempts, 1);
+        assert.equal(f.c.state.status, outcome === 'failed' ? 'failed' : 'uncertain');
+        if (outcome === 'transport-unknown') assert.match(f.c.state.error, /未重送/);
+      } else {
+        if (outcome === 'no-new-completion') {
+          assert.equal(attempts, 1);
+          assert.equal(f.c.state.status, 'working');
+          const saved = (await listMainSessions(f.root)).sessions.find(row => row.threadId === 'codex-parent');
+          assert.equal(saved.workerNotifications['goal-worker'], undefined);
+          emit({
+            method: 'turn/completed',
+            params: {threadId: 'codex-parent', turn: {id: 'native-goal-turn', status: 'completed'}}
+          });
+        }
+        let timer;
+        try {
+          await Promise.race([
+            f.toolOutputSent,
+            new Promise((_, reject) => {
+              timer = setTimeout(() => reject(Error('native completion wakeup was lost')), 5000);
+            })
+          ]);
+        } finally {
+          clearTimeout(timer);
+        }
+        assert.equal(attempts, 2);
+        assert.equal(f.workerRecords.size, 1);
+      }
+    } finally {
+      release();
+      f.c.state.goal = null;
+      if (f.c.state.status === 'uncertain') await f.c.stop();
+      await f.c.close();
+    }
+  });
+test('native goal turn winning a Flash notification race preserves rejected results for the next completion', async () => {
+  const f = await fixture();
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    await f.c.send({text: 'fake goal work'});
+    const emit = f.hostOptions.at(-1).onEvent;
+    f.c.state.goal = {status: 'active'};
+    const original = f.host.request;
+    let attempts = 0;
+    f.host.request = async (method, p, ...rest) => {
+      if (method === 'turn/start' && p.toolOutput && ++attempts === 1) {
+        emit({method: 'turn/started', params: {threadId: 'codex-parent', turn: {id: 'native-goal-turn'}}});
+        throw Object.assign(Error('native turn already active'), {protocolMessage: {code: -32600}});
+      }
+      return original(method, p, ...rest);
+    };
+    await f.gatewayOptions[0].bridge.start({
+      requestId: 'goal-worker',
+      model: 'gemini-3.8-flash',
+      effort: 'low',
+      task: 'fake'
+    });
+    const record = f.workerRecords.get('goal-worker');
+    Object.assign(record, {status: 'completed', settled: true, output: 'done'});
+    f.bridgeOptions[0].onChange(record);
+    emit({method: 'turn/completed', params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}});
+    for (let i = 0; i < 100 && attempts < 1; i++) await new Promise(r => setTimeout(r, 10));
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(f.c.state.status, 'working');
+    assert.equal(f.c.state.error, null);
+    emit({
+      method: 'turn/completed',
+      params: {threadId: 'codex-parent', turn: {id: 'native-goal-turn', status: 'completed'}}
+    });
+    let timer;
+    try {
+      await Promise.race([
+        f.toolOutputSent,
+        new Promise((_, reject) => {
+          timer = setTimeout(() => reject(Error('native goal completion notification timed out')), 5000);
+        })
+      ]);
+    } finally {
+      clearTimeout(timer);
+    }
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(attempts, 2);
+    assert.equal(f.c.state.status, 'working');
+    assert.equal(f.workerRecords.size, 1);
+  } finally {
+    f.c.state.goal = null;
+    await f.c.close();
+  }
+});
+
+for (const [provider, model] of [
+  ['gemini', 'gemini-3.8-flash'],
+  ['claude', 'claude-opus-5-5']
+])
+  test(`quiet ${provider} notification is delivered once and leaves completion armed`, async () => {
+    const f = await fixture();
+    try {
+      await f.c.open({model: 'gpt-6-astra'});
+      await f.c.send({text: 'long work'});
+      const bridge = f.gatewayOptions[0].bridge;
+      await bridge.start({requestId: 'quiet-notice', model, effort: 'low', task: 'fake'});
+      const record = f.workerRecords.get('quiet-notice');
+      record.inspection = {
+        noticeId: 'quiet-fixture',
+        checkedAt: 1000,
+        lastActivityAt: 0,
+        statusObserved: 'running',
+        reason: 'quiet'
+      };
+      f.bridgeOptions[0].onChange(record);
+      f.hostOptions.at(-1).onEvent({
+        method: 'turn/completed',
+        params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+      });
+      await f.toolOutputSent;
+      await new Promise(r => setTimeout(r, 30));
+      assert.match(f.calls.find(x => x.params?.toolOutput)?.params.toolOutput.output, /久無活動也不等於卡死/);
+      f.hostOptions.at(-1).onEvent({
+        method: 'turn/completed',
+        params: {threadId: 'codex-parent', turn: {id: 'turn-2', status: 'completed'}}
+      });
+      for (let i = 0; i < 3; i++) f.bridgeOptions[0].onChange(record);
+      await new Promise(r => setTimeout(r, 30));
+      assert.equal(f.calls.filter(x => x.params?.toolOutput).length, 1);
+      delete record.inspection;
+      record.lastActivityAt = 5000;
+      f.bridgeOptions[0].onChange(record);
+      record.inspection = {
+        noticeId: 'quiet-fixture',
+        checkedAt: 9000,
+        lastActivityAt: 5000,
+        statusObserved: 'running',
+        reason: 'next long command'
+      };
+      f.bridgeOptions[0].onChange(record);
+      await new Promise(r => setTimeout(r, 20));
+      assert.equal(
+        f.calls.filter(x => x.params?.toolOutput).length,
+        1,
+        'same job does not wake again just for another quiet command'
+      );
+      const saved = (await listMainSessions(f.root)).sessions.find(s => s.threadId === 'codex-parent');
+      assert.equal(saved.workerNotifications['quiet-fixture'], 'delivery-attempted');
+      assert.equal(saved.workerNotifications['quiet-notice'], undefined);
+      record.status = 'completed';
+      record.settled = true;
+      delete record.inspection;
+      f.bridgeOptions[0].onChange(record);
+      for (let i = 0; i < 30 && !f.calls.some(x => x.params?.toolOutput?.output.includes('工人完成通知')); i++)
+        await new Promise(r => setTimeout(r, 10));
+      assert.equal(f.calls.filter(x => x.params?.toolOutput).length, 2);
+      assert.equal(f.workerRecords.size, 1);
+    } finally {
+      await f.c.close();
+    }
+  });
+
+test('a live clarification reaches Codex while account handoff preflight waits for worker settlement', async () => {
+  const f = await fixture();
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    await f.c.send({text: 'work'});
+    const original = f.host.request;
+    f.host.request = (method, params) =>
+      method === 'thread/loaded/list' ? Promise.resolve({data: ['codex-parent']}) : original(method, params);
+    await f.gatewayOptions[0].bridge.start({
+      requestId: 'clarify',
+      model: 'claude-opus-5-5',
+      effort: 'low',
+      task: 'fake'
+    });
+    const record = f.workerRecords.get('clarify');
+    const completeTurn = id => f.hostOptions.at(-1).onEvent({
+      method: 'turn/completed',
+      params: {threadId: 'codex-parent', turn: {id, status: 'completed'}}
+    });
+    f.bridgeOptions[0].onGeminiHandoff({
+      parentId: 'codex-parent',
+      status: 'ready',
+      requestIds: [],
+      queryIds: ['held-ready']
+    });
+    record.pendingQuestion = {id: 'test-question', text: 'Which sample?'};
+    f.bridgeOptions[0].onChange(record);
+    completeTurn('turn-1');
+    const output = n => f.calls.filter(call => call.params?.toolOutput)[n]?.params.toolOutput.output;
+    for (let i = 0; i < 100 && !f.c.state.tools.some(tool => tool.name === '工人提問'); i++)
+      await new Promise(resolve => setTimeout(resolve, 5));
+    assert.match(output(0), /^K 工人提問/);
+    assert.match(output(0), /test-question/);
+    assert.doesNotMatch(output(0), /held-ready/);
+
+    delete record.pendingQuestion;
+    Object.assign(record, {status: 'completed', settled: true});
+    f.bridgeOptions[0].onChange(record);
+    completeTurn('turn-2');
+    for (let i = 0; i < 100 && !output(1); i++) await new Promise(resolve => setTimeout(resolve, 5));
+    assert.match(output(1), /held-ready/);
+    assert.match(output(1), /K 工人完成通知/);
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('fresh Flash activity removes a queued quiet warning before the parent is idle', async () => {
+  const f = await fixture();
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    await f.c.send({text: 'long work'});
+    const bridge = f.gatewayOptions[0].bridge;
+    await bridge.start({requestId: 'fresh-before-idle', model: 'gemini-3.8-flash', effort: 'low', task: 'fake'});
+    const record = f.workerRecords.get('fresh-before-idle');
+    record.inspection = {noticeId: 'quiet-expired'};
+    f.bridgeOptions[0].onChange(record);
+    delete record.inspection;
+    record.lastActivityAt = Date.now();
+    f.bridgeOptions[0].onChange(record);
+    f.hostOptions.at(-1).onEvent({
+      method: 'turn/completed',
+      params: {threadId: 'codex-parent', turn: {id: 'turn-1', status: 'completed'}}
+    });
+    await new Promise(r => setTimeout(r, 40));
+    assert.equal(f.calls.filter(x => x.params?.toolOutput).length, 0);
+  } finally {
+    await f.c.close();
+  }
+});
+
+test('every K-submitted Codex turn carries current private context and revokes delivered rules on deletion', async () => {
+  await mkdir(scratchBase, {recursive: true});
+  const root = await mkdtemp(path.join(scratchBase, 'codex common memory 私人-'));
+  const file = commonMemoryPath(root);
+  const rulesFile = globalRulesPath(root);
+  await mkdir(path.dirname(file), {recursive: true});
+  await writeFile(file, '# 合成\n- GPT 假偏好甲\n');
+  const f = await fixture({root});
+  const turns = () => f.calls.filter(call => call.method === 'turn/start').map(call => call.params);
+  const memory = params => params.additionalContext.k_common_memory;
+  const complete = id =>
+    f.hostOptions.at(-1).onEvent({
+      method: 'turn/completed',
+      params: {threadId: 'codex-parent', turn: {id, status: 'completed'}}
+    });
+  try {
+    await f.c.open({model: 'gpt-6-astra'});
+    assert.ok(f.calls.find(call => call.method === 'thread/start').params.developerInstructions.includes(file));
+    assert.doesNotMatch(
+      f.calls.find(call => call.method === 'thread/start').params.developerInstructions,
+      /GPT 假偏好/,
+      'the body uses one path only'
+    );
+    await f.c.send({text: '第一句'});
+    assert.deepEqual(Object.keys(turns()[0].additionalContext), ['k_common_memory', 'k_global_rules']);
+    assert.match(turns()[0].additionalContext.k_global_rules.value, /目前未啟用（檔案不存在/);
+    assert.equal(memory(turns()[0]).kind, 'application');
+    assert.match(memory(turns()[0]).value, /GPT 假偏好甲/);
+    assert.deepEqual(turns()[0].input, [{type: 'text', text: '第一句'}]);
+    await assert.rejects(f.c.steer({text: '補充'}), /修正未套用/);
+    const steer = f.calls.find(call => call.method === 'turn/steer').params;
+    assert.deepEqual(steer.additionalContext, turns()[0].additionalContext, 'a steer must not clear the native map');
+    complete('turn-1');
+
+    await f.c.send({text: '第二句'});
+    assert.deepEqual(turns()[1].additionalContext, turns()[0].additionalContext, 'unchanged: native dedupe');
+    complete('turn-2');
+
+    await writeFile(file, '# 合成\n- GPT 假偏好乙\n');
+    await writeFile(rulesFile, '先前合成規則😀\n'.repeat(600));
+    f.hostOptions.at(-1).onEvent({
+      method: 'item/completed',
+      params: {threadId: 'codex-parent', item: {type: 'contextCompaction', id: 'compact-1'}}
+    });
+    await f.c.send({text: '第三句'});
+    assert.match(memory(turns()[2]).value, /GPT 假偏好乙[\s\S]*第 1 次壓縮後重新附上/);
+    assert.doesNotMatch(memory(turns()[2]).value, /假偏好甲/);
+    const delivered = turns()[2].additionalContext;
+    assert.match(delivered.k_global_rules.value, /先前合成規則/);
+    assert.match(delivered.k_global_rules_3.value, /先前合成規則/);
+    complete('turn-3');
+
+    await rm(rulesFile);
+    await f.c.send({text: '刪檔後的新訊息'});
+    const afterDeletion = turns()[3];
+    assert.deepEqual(afterDeletion.input, [{type: 'text', text: '刪檔後的新訊息'}]);
+    // Native Codex emits changed values and silently drops absent keys from its dedupe map.
+    const changed = Object.entries(afterDeletion.additionalContext).filter(
+      ([key, entry]) => delivered[key]?.value !== entry.value
+    );
+    assert.deepEqual(changed.map(([key]) => key), ['k_global_rules']);
+    const withdrawal = changed[0][1].value;
+    assert.equal(
+      withdrawal,
+      `K 跨模型全域工作規則目前未啟用（檔案不存在；${rulesFile}）。若本對話先前曾附上任何全域工作規則版本或分段，均已失效，請依當輪指示與專案規則。\n（本對話第 1 次壓縮後重新附上）`
+    );
+    assert.ok(Buffer.byteLength(withdrawal, 'utf8') <= CODEX_CONTEXT_BYTES);
+    assert.deepEqual(Object.keys(afterDeletion.additionalContext), ['k_common_memory', 'k_global_rules']);
+    complete('turn-4');
+
+    await rm(file);
+    const bridge = f.gatewayOptions[0].bridge;
+    await bridge.start({requestId: 'common-memory-worker', model: 'gpt-6-luna', effort: 'high', task: '合成'});
+    const record = f.workerRecords.get('common-memory-worker');
+    Object.assign(record, {status: 'completed', settled: true, output: '合成輸出'});
+    f.bridgeOptions[0].onChange(record);
+    await f.toolOutputSent;
+    await new Promise(resolve => setImmediate(resolve));
+    const notice = turns().find(params => params.toolOutput);
+    assert.deepEqual(notice.input, []);
+    assert.equal(notice.toolOutput.name, 'gemini_start');
+    assert.match(notice.toolOutput.output, /合成輸出/);
+    assert.match(memory(notice).value, /K 共同記憶目前未啟用（檔案不存在/);
+    assert.doesNotMatch(memory(notice).value, /假偏好/);
+  } finally {
+    await f.c.close();
+  }
+});

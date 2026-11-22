@@ -1,0 +1,546 @@
+import {spawn} from 'node:child_process';
+import {appendFile, mkdir} from 'node:fs/promises';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+
+export const MAX_WAV_BYTES = 12 * 1024 * 1024;
+export const MAX_WAV_DURATION_SECONDS = 5 * 60;
+export const MAX_JSON_BYTES = 16 * 1024 * 1024;
+const helperPath = fileURLToPath(new URL('../scripts/local-dictation.py', import.meta.url));
+const windowsHelperPath = fileURLToPath(new URL('../scripts/windows-dictation.ps1', import.meta.url));
+const MAX_DIAGNOSTIC_CHARS = 16 * 1024;
+
+export class LocalDictationError extends Error {
+  constructor(message, {code = 'LOCAL_DICTATION_FAILED', statusCode = 500, cause, diagnostic} = {}) {
+    super(message, {cause});
+    this.name = 'LocalDictationError';
+    this.code = code;
+    this.statusCode = statusCode;
+    this.diagnostic = diagnostic;
+  }
+}
+
+export function decodePcm16Mono16kWav(audioBase64) {
+  if (
+    typeof audioBase64 !== 'string' ||
+    !audioBase64 ||
+    audioBase64.length > Math.ceil(MAX_WAV_BYTES / 3) * 4 ||
+    audioBase64.length % 4 !== 0 ||
+    !/^[A-Za-z0-9+/]*={0,2}$/.test(audioBase64)
+  ) {
+    throw new LocalDictationError('音訊資料格式無效。', {code: 'INVALID_AUDIO', statusCode: 400});
+  }
+  const wav = Buffer.from(audioBase64, 'base64');
+  if (wav.length > MAX_WAV_BYTES || wav.toString('base64') !== audioBase64) {
+    throw new LocalDictationError('音訊資料過大或格式無效。', {code: 'INVALID_AUDIO', statusCode: 400});
+  }
+  validatePcm16Mono16kWav(wav);
+  return wav;
+}
+
+export function validatePcm16Mono16kWav(wav) {
+  if (
+    !Buffer.isBuffer(wav) ||
+    wav.length < 44 ||
+    wav.length > MAX_WAV_BYTES ||
+    wav.toString('ascii', 0, 4) !== 'RIFF' ||
+    wav.toString('ascii', 8, 12) !== 'WAVE'
+  ) {
+    throw new LocalDictationError('音訊須為 PCM16、單聲道、16 kHz 的 WAV。', {code: 'INVALID_AUDIO', statusCode: 400});
+  }
+  const riffEnd = wav.readUInt32LE(4) + 8;
+  if (riffEnd !== wav.length || riffEnd < 12) {
+    throw new LocalDictationError('WAV 區塊長度無效。', {code: 'INVALID_AUDIO', statusCode: 400});
+  }
+  let fmt = null;
+  let dataBytes = null;
+  let offset = 12;
+  while (offset < riffEnd) {
+    if (offset + 8 > riffEnd)
+      throw new LocalDictationError('WAV 區塊標頭不完整。', {code: 'INVALID_AUDIO', statusCode: 400});
+    const id = wav.toString('ascii', offset, offset + 4);
+    const size = wav.readUInt32LE(offset + 4);
+    const start = offset + 8;
+    const end = start + size;
+    if (end > riffEnd || end < start)
+      throw new LocalDictationError('WAV 區塊超出檔案界線。', {code: 'INVALID_AUDIO', statusCode: 400});
+    if (id === 'fmt ') {
+      if (fmt || size < 16)
+        throw new LocalDictationError('WAV 格式區塊無效。', {code: 'INVALID_AUDIO', statusCode: 400});
+      fmt = {
+        format: wav.readUInt16LE(start),
+        channels: wav.readUInt16LE(start + 2),
+        sampleRate: wav.readUInt32LE(start + 4),
+        byteRate: wav.readUInt32LE(start + 8),
+        blockAlign: wav.readUInt16LE(start + 12),
+        bits: wav.readUInt16LE(start + 14)
+      };
+    } else if (id === 'data') {
+      if (dataBytes !== null)
+        throw new LocalDictationError('WAV 含不支援的多個音訊區塊。', {code: 'INVALID_AUDIO', statusCode: 400});
+      dataBytes = size;
+    }
+    offset = end + (size & 1);
+    if (offset > riffEnd)
+      throw new LocalDictationError('WAV 區塊填補長度無效。', {code: 'INVALID_AUDIO', statusCode: 400});
+  }
+  if (
+    offset !== riffEnd ||
+    !fmt ||
+    dataBytes === null ||
+    fmt.format !== 1 ||
+    fmt.channels !== 1 ||
+    fmt.sampleRate !== 16000 ||
+    fmt.bits !== 16 ||
+    fmt.blockAlign !== 2 ||
+    fmt.byteRate !== 32000 ||
+    dataBytes === 0 ||
+    dataBytes % 2 !== 0 ||
+    dataBytes > MAX_WAV_DURATION_SECONDS * 16000 * 2
+  ) {
+    throw new LocalDictationError('WAV 須為 PCM16、單聲道、16 kHz，且不超過五分鐘。', {
+      code: 'INVALID_AUDIO',
+      statusCode: 400
+    });
+  }
+  return {durationSeconds: dataBytes / 32000, dataBytes};
+}
+
+function childEnvironment(source, modelPath, pythonPath, provider) {
+  const env = {};
+  // ProgramFiles: nvidia-smi (NVML), which the helper uses to check free GPU memory, fails without it.
+  for (const name of ['SystemRoot', 'WINDIR', 'TEMP', 'TMP', 'PATH', 'ProgramFiles']) {
+    const key = Object.keys(source).find(value => value.toUpperCase() === name.toUpperCase());
+    if (key && typeof source[key] === 'string') env[name] = source[key];
+  }
+  if (provider === 'windows') {
+    for (const name of ['USERPROFILE', 'APPDATA', 'LOCALAPPDATA']) if (source[name]) env[name] = source[name];
+    return env;
+  }
+  const sitePackages = path.join(path.dirname(path.dirname(pythonPath)), 'Lib', 'site-packages');
+  const cudaBins = ['cublas', 'cuda_runtime', 'cuda_nvrtc', 'cudnn'].map(name =>
+    path.join(sitePackages, 'nvidia', name, 'bin')
+  );
+  const systemRoot = env.SystemRoot ?? env.WINDIR ?? 'C:\\Windows';
+  env.PATH = [...cudaBins, path.dirname(pythonPath), path.join(systemRoot, 'System32')].join(path.delimiter);
+  if (source.K_DICTATION_VOCABULARY_ROOT) env.K_DICTATION_VOCABULARY_ROOT = source.K_DICTATION_VOCABULARY_ROOT;
+  env.K_DICTATION_MODEL = modelPath;
+  env.HF_HUB_OFFLINE = '1';
+  env.HF_HUB_DISABLE_TELEMETRY = '1';
+  env.TRANSFORMERS_OFFLINE = '1';
+  return env;
+}
+
+export function createLocalDictation({
+  provider = process.env.K_DICTATION_PROVIDER,
+  pythonPath = process.env.K_DICTATION_PYTHON,
+  modelPath = process.env.K_DICTATION_MODEL,
+  scriptPath = provider === 'windows' ? windowsHelperPath : helperPath,
+  spawnImpl = spawn,
+  diagnosticsFile = null,
+  stopTimeoutMs = 5000,
+  prepareLeaseMs = (MAX_WAV_DURATION_SECONDS + 60) * 1000
+} = {}) {
+  const configured = provider === 'windows' || (provider === 'whisper' &&
+    typeof pythonPath === 'string' && path.isAbsolute(pythonPath) &&
+    typeof modelPath === 'string' && path.isAbsolute(modelPath));
+  if (!configured) {
+    const unavailable = async () => {
+      throw new LocalDictationError('本機聽寫尚未設定。請先選擇辨識方式。', {
+        code: 'DICTATION_NOT_CONFIGURED', statusCode: 503
+      });
+    };
+    return {configured: false, busy: false, prepare: unavailable, transcribe: unavailable, close: async () => {}};
+  }
+  if (
+    !path.isAbsolute(scriptPath) ||
+    !Number.isInteger(stopTimeoutMs) ||
+    stopTimeoutMs < 1 ||
+    !Number.isInteger(prepareLeaseMs) ||
+    prepareLeaseMs < 1
+  ) {
+    throw new TypeError('Absolute Python/helper paths and a positive timeout are required.');
+  }
+  const MAX_CONCURRENT_JOBS = 3;
+  const jobs = new Map();
+  let closed = false;
+  let diagnostics = Promise.resolve();
+
+  function recordFailure(job, error) {
+    if (
+      !diagnosticsFile ||
+      !error ||
+      ['LOCAL_DICTATION_ABORTED', 'LOCAL_DICTATION_RELEASED', 'LOCAL_DICTATION_SHUTDOWN'].includes(error.code)
+    ) return;
+    // Never persist stdout (the transcript), audio, request IDs or the process environment.
+    // JSON parse errors can quote stdout, so protocol failures use a fixed description.
+    const detail = error.code === 'LOCAL_DICTATION_PROTOCOL' ? 'Invalid transcription response' : error.diagnostic;
+    const line = JSON.stringify({
+      time: new Date().toISOString(),
+      startedAt: new Date(job.startedAt).toISOString(),
+      elapsedMs: Date.now() - job.startedAt,
+      provider,
+      phase: job.adopted ? 'transcribe' : 'prepare',
+      pid: job.child?.pid ?? null,
+      code: error.code,
+      exitCode: job.exitCode ?? null,
+      signal: job.exitSignal ?? null,
+      audioBytes: job.audioBytes ?? 0,
+      diagnostic: typeof detail === 'string' ? detail.slice(-MAX_DIAGNOSTIC_CHARS) : null,
+      stderr: job.errors.trim(),
+      stderrTruncated: job.stderrTruncated
+    }) + '\n';
+    diagnostics = diagnostics
+      .then(async () => {
+        await mkdir(path.dirname(diagnosticsFile), {recursive: true});
+        await appendFile(diagnosticsFile, line, 'utf8');
+      })
+      .catch(() => {}); // A logging failure must not replace the original error or trigger a retry.
+  }
+
+  function newJob(fields) {
+    return {
+      id: null,
+      child: null,
+      childClosed: false,
+      responseSettled: false,
+      stopReason: null,
+      stopError: null,
+      output: '',
+      errors: '',
+      stderrTruncated: false,
+      startedAt: Date.now(),
+      stopTimer: null,
+      resolve: null,
+      reject: null,
+      signal: null,
+      adopted: true,
+      prepareResolve: null,
+      prepareSignal: null,
+      ...fields
+    };
+  }
+
+  function finish(job, error, value) {
+    if (job.responseSettled) return;
+    job.responseSettled = true;
+    recordFailure(job, error);
+    clearTimeout(job.leaseTimer);
+    job.signal?.removeEventListener('abort', job.onAbort);
+    job.prepareSignal?.removeEventListener('abort', job.onPrepareAbort);
+    if (!job.child || job.childClosed) {
+      if (job.id && jobs.get(job.id) === job) jobs.delete(job.id);
+    }
+    // A warm helper that never received audio only reports that it was not used.
+    if (!job.adopted) job.prepareResolve?.({ok: true, prepared: false});
+    else if (error) job.reject(error);
+    else job.resolve(value);
+  }
+
+  function stopChild(job, reason, error) {
+    job.stopError ??= error;
+    job.stopReason ??= reason;
+    if (!job.child) {
+      finish(job, job.stopError);
+      return;
+    }
+    if (job.childClosed) {
+      finish(job, job.stopError);
+      return;
+    }
+    if (!job.killRequested) {
+      job.stopTimer = setTimeout(() => {
+        if (!job.childClosed)
+          finish(
+            job,
+            new LocalDictationError('本機辨識程序尚未結束，已暫停新的辨識工作。', {
+              code: 'LOCAL_DICTATION_STOP_UNCONFIRMED',
+              statusCode: 503,
+              diagnostic: job.killDiagnostic ?? job.stopError?.message
+            })
+          );
+      }, stopTimeoutMs);
+      job.killRequested = true;
+      try {
+        job.child.kill();
+      } catch (cause) {
+        job.killDiagnostic = cause.message;
+      }
+    }
+  }
+
+  // A transcribe request's abort (cancel/disconnect) stops only its own child.
+  function settleOnRequest(job, signal) {
+    job.signal = signal;
+    job.onAbort = () =>
+      stopChild(
+        job,
+        'aborted',
+        new LocalDictationError('語音辨識要求已取消。', {code: 'LOCAL_DICTATION_ABORTED', statusCode: 499})
+      );
+    signal?.addEventListener('abort', job.onAbort, {once: true});
+    return new Promise((resolve, reject) => {
+      job.resolve = resolve;
+      job.reject = reject;
+    });
+  }
+
+  function spawnChild(job) {
+    const executable =
+      provider === 'windows'
+        ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32/WindowsPowerShell/v1.0/powershell.exe')
+        : pythonPath;
+    const args =
+      provider === 'windows' ? ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'RemoteSigned', '-File', scriptPath] : ['-I', '-B', scriptPath];
+    const child = spawnImpl(executable, args, {
+      cwd: path.dirname(scriptPath),
+      env: childEnvironment(process.env, modelPath, pythonPath, provider),
+      windowsHide: true,
+      shell: false,
+      stdio: ['pipe', 'pipe', 'pipe']
+    });
+    job.child = child;
+    child.stdout.setEncoding('utf8');
+    child.stderr.setEncoding('utf8');
+    child.stdout.on('data', chunk => {
+      job.output += chunk;
+    });
+    child.stderr.on('data', chunk => {
+      job.errors += chunk;
+      if (job.errors.length > MAX_DIAGNOSTIC_CHARS) {
+        job.errors = job.errors.slice(-MAX_DIAGNOSTIC_CHARS);
+        job.stderrTruncated = true;
+      }
+    });
+    child.once('error', error =>
+      stopChild(
+        job,
+        'spawn-error',
+        new LocalDictationError('無法啟動本機語音辨識。', {
+          code: 'LOCAL_DICTATION_SPAWN',
+          statusCode: 503,
+          cause: error,
+          diagnostic: error.message
+        })
+      )
+    );
+    child.once('close', (code, childSignal) => {
+      job.childClosed = true;
+      job.exitCode = code;
+      job.exitSignal = childSignal;
+      clearTimeout(job.stopTimer);
+      if (job.id && jobs.get(job.id) === job) jobs.delete(job.id);
+      if (!job.adopted) {
+        finish(
+          job,
+          code !== 0 && !job.stopReason
+            ? new LocalDictationError('本機語音辨識預先載入失敗。', {
+                code: 'LOCAL_DICTATION_PROCESS',
+                diagnostic: job.errors.trim() || `exit=${code ?? childSignal ?? 'unknown'}`
+              })
+            : job.stopError
+        );
+        return;
+      }
+      // The helper loads the model before reading stdin, so a load failure surfaces as a broken
+      // pipe; report the helper's own error instead.
+      const failedBeforeReading = job.stopReason === 'stdin-error' && code !== null && code !== 0 && job.errors.trim();
+      if (job.stopReason && !failedBeforeReading) {
+        finish(
+          job,
+          job.stopError ??
+            new LocalDictationError('本機語音辨識已停止。', {code: 'LOCAL_DICTATION_STOPPED', statusCode: 503})
+        );
+        return;
+      }
+      if (code !== 0) {
+        finish(
+          job,
+          new LocalDictationError('本機語音辨識失敗。', {
+            code: 'LOCAL_DICTATION_PROCESS',
+            statusCode: 500,
+            diagnostic: job.errors.trim() || `exit=${code ?? childSignal ?? 'unknown'}`
+          })
+        );
+        return;
+      }
+      try {
+        const result = JSON.parse(job.output.trim());
+        if (!result || result.ok !== true || typeof result.text !== 'string') throw new Error('辨識回覆格式無效。');
+        finish(job, null, {ok: true, text: result.text});
+      } catch (error) {
+        finish(
+          job,
+          new LocalDictationError('本機語音辨識回覆格式無效。', {
+            code: 'LOCAL_DICTATION_PROTOCOL',
+            statusCode: 500,
+            cause: error,
+            diagnostic: error.message
+          })
+        );
+      }
+    });
+  }
+
+  function attachAudio(job, wav) {
+    job.audioBytes = wav.length;
+    const failed = error =>
+      stopChild(
+        job,
+        'stdin-error',
+        new LocalDictationError('傳送音訊至本機辨識器失敗。', {
+          code: 'LOCAL_DICTATION_STDIN',
+          statusCode: 500,
+          cause: error,
+          diagnostic: error.message
+        })
+      );
+    job.child.stdin.once('error', error => {
+      if (!job.childClosed) failed(error);
+    });
+    try {
+      job.child.stdin.end(wav);
+    } catch (error) {
+      failed(error);
+    }
+  }
+
+  function startChild(job, wav) {
+    try {
+      spawnChild(job);
+      if (wav) attachAudio(job, wav);
+    } catch (error) {
+      const failure =
+        error instanceof LocalDictationError
+          ? error
+          : new LocalDictationError('無法啟動本機語音辨識。', {
+              code: 'LOCAL_DICTATION_SPAWN',
+              statusCode: 503,
+              cause: error,
+              diagnostic: error.message
+            });
+      if (job.child) stopChild(job, 'spawn-error', failure);
+      else finish(job, failure);
+    }
+  }
+
+  // Starts the helper while the user is still speaking so the model is loaded when the audio
+  // arrives. The signal is the lease: aborting it before transcribe() adopts the helper releases
+  // it. Best-effort; transcribe() falls back to a fresh helper whenever none is ready.
+  async function prepare({id, signal} = {}) {
+    if (closed || signal?.aborted) return {ok: true, prepared: false};
+    if (typeof id !== 'string' || !id.trim() || id.length > 128) {
+      throw new LocalDictationError('預先載入要求格式無效。', {code: 'INVALID_REQUEST', statusCode: 400});
+    }
+    if (jobs.has(id)) {
+      const existing = jobs.get(id);
+      if (!existing.childClosed) return {ok: true, prepared: false};
+      jobs.delete(id);
+    }
+    if (jobs.size >= MAX_CONCURRENT_JOBS) return {ok: true, prepared: false};
+    const job = newJob({id, adopted: false, prepareSignal: signal});
+    jobs.set(id, job);
+    job.prepareResult = new Promise(resolve => {
+      job.prepareResolve = resolve;
+    });
+    job.onPrepareAbort = () =>
+      stopChild(
+        job,
+        'released',
+        new LocalDictationError('預先載入已釋放。', {code: 'LOCAL_DICTATION_RELEASED', statusCode: 499})
+      );
+    signal?.addEventListener('abort', job.onPrepareAbort, {once: true});
+    // Recording stops by itself after five minutes, so a helper still unused well past that is stale
+    // (for example a phone that vanished without closing its connection); free its GPU memory.
+    job.leaseTimer = setTimeout(job.onPrepareAbort, prepareLeaseMs);
+    startChild(job);
+    return job.prepareResult;
+  }
+
+  async function transcribe(audioBase64, {id, signal} = {}) {
+    if (closed)
+      throw new LocalDictationError('本機語音辨識正在關閉。', {code: 'LOCAL_DICTATION_CLOSED', statusCode: 503});
+    if (id !== undefined && (typeof id !== 'string' || !id.trim() || id.length > 128)) {
+      throw new LocalDictationError('請提供有效的 id。', {code: 'INVALID_REQUEST', statusCode: 400});
+    }
+    const jobId = id || crypto.randomUUID();
+    let warm = jobs.get(jobId);
+    // A recording that starts right after a cancel can arrive while the released helper is still
+    // exiting; wait for that (bounded by the stop timeout) instead of rejecting it as busy.
+    if (warm && !warm.adopted && warm.stopReason) {
+      await warm.prepareResult;
+      if (closed)
+        throw new LocalDictationError('本機語音辨識正在關閉。', {code: 'LOCAL_DICTATION_CLOSED', statusCode: 503});
+      warm = jobs.get(jobId);
+    }
+    const canAdopt = warm && !warm.adopted && !warm.stopReason && !warm.childClosed;
+    if (warm && !canAdopt)
+      throw new LocalDictationError('這筆語音辨識已在進行中。', {code: 'LOCAL_DICTATION_BUSY', statusCode: 409});
+    if (!canAdopt && jobs.size >= MAX_CONCURRENT_JOBS) {
+      throw new LocalDictationError('已有一筆語音辨識工作進行中。', {code: 'LOCAL_DICTATION_BUSY', statusCode: 409});
+    }
+    const wav = decodePcm16Mono16kWav(audioBase64);
+    if (signal?.aborted)
+      throw new LocalDictationError('語音辨識要求已取消。', {code: 'LOCAL_DICTATION_ABORTED', statusCode: 499});
+    // Long audio has no fixed total deadline; the request's abort (cancel/disconnect) or close() stops it.
+    if (canAdopt) {
+      clearTimeout(warm.leaseTimer);
+      warm.prepareSignal?.removeEventListener('abort', warm.onPrepareAbort);
+      warm.prepareResolve({ok: true, prepared: true});
+      warm.adopted = true;
+      const done = settleOnRequest(warm, signal);
+      attachAudio(warm, wav);
+      return done;
+    }
+    const job = newJob({id: jobId});
+    jobs.set(jobId, job);
+    const done = settleOnRequest(job, signal);
+    startChild(job, wav);
+    return done;
+  }
+
+  async function close() {
+    closed = true;
+    const activeJobs = Array.from(jobs.values()).filter(j => !j.childClosed);
+    for (const job of activeJobs) {
+      stopChild(
+        job,
+        'shutdown',
+        new LocalDictationError('本機語音辨識已關閉。', {code: 'LOCAL_DICTATION_SHUTDOWN', statusCode: 503})
+      );
+    }
+    await Promise.all(
+      activeJobs.map(
+        job =>
+          new Promise(resolve => {
+            if (job.childClosed) return resolve();
+            job.child?.once('close', resolve);
+            job.closeWaitTimer = setTimeout(resolve, stopTimeoutMs);
+          })
+      )
+    );
+    for (const job of activeJobs) {
+      clearTimeout(job.closeWaitTimer);
+    }
+    await diagnostics;
+    const unconfirmed = activeJobs.find(j => !j.childClosed);
+    if (unconfirmed) {
+      throw new LocalDictationError('本機辨識程序尚未結束，仍保留工作鎖。', {
+        code: 'LOCAL_DICTATION_STOP_UNCONFIRMED',
+        statusCode: 503,
+        diagnostic: unconfirmed.killDiagnostic
+      });
+    }
+  }
+
+  return {
+    configured: true,
+    prepare,
+    transcribe,
+    close,
+    // Any helper still running (including one whose stop is unconfirmed) keeps K from updating.
+    get busy() {
+      return jobs.size > 0;
+    }
+  };
+}

@@ -1,0 +1,498 @@
+import {createServer} from 'node:http';
+import {randomBytes} from 'node:crypto';
+import {mkdir, realpath} from 'node:fs/promises';
+import path from 'node:path';
+import {Readable} from 'node:stream';
+import {pipeline} from 'node:stream/promises';
+import {createBrowserOwnerGateway} from './browser-owner-gateway.mjs';
+import {admitMcpRequest, readLimitedBody} from './mcp-http-guard.mjs';
+
+const MODES = new Set(['regular', 'incognito']);
+const browserSessionTool = {
+  name: 'browser_session',
+  description:
+    'Select external Chrome mode and profileId before browser tools. Use browser_profiles to discover profile identities. A Chrome profile is NOT a Google account; verify the website account before account-specific work. Tabs are only the assistant-managed group, not all profile tabs. Multiple profiles require an explicit target; existing sessions stay pinned, without fallback. If the target profileId is listed but not connected, K opens exactly that profile minimized (also while Chrome runs other profiles) and waits for its own verified connection; an unknown profileId fails without opening another profile. With no profileId and nothing connected, K starts Chrome minimized. After a stop or a closed Chrome, call this again for a fresh connection; interrupted operations are not replayed.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      mode: {type: 'string', enum: ['regular', 'incognito'], description: 'External Chrome mode to select.'},
+      profileId: {
+        type: 'string',
+        pattern: '^[a-f0-9]{32}$',
+        description: 'Stable local Chrome profile identity from browser_profiles.'
+      }
+    },
+    required: ['mode'],
+    additionalProperties: false
+  }
+};
+const browserProfilesTool = {
+  name: 'browser_profiles',
+  description:
+    'List K Chrome profile IDs and current native connection/mode capabilities on demand. Does not read account data, open tabs, reconnect or select a profile. browser_session with a listed but disconnected profileId opens that profile.',
+  inputSchema: {type: 'object', properties: {}, additionalProperties: false}
+};
+
+function rpcError(id, code, message) {
+  return {jsonrpc: '2.0', id: id ?? null, error: {code, message}};
+}
+function unpack(text) {
+  const data = text
+    .split(/\r?\n/u)
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).trim())
+    .filter(Boolean);
+  return JSON.parse(data.length ? data.join('\n') : text);
+}
+function pack(response, message) {
+  return new Response(`event: message\ndata: ${JSON.stringify(message)}\n\n`, {
+    status: response.status,
+    headers: {'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache'}
+  });
+}
+async function makeDir(parent, name) {
+  const root = await realpath(parent),
+    target = path.join(root, name);
+  await mkdir(target, {recursive: false}).catch(error => {
+    if (error.code !== 'EEXIST') throw error;
+  });
+  if ((await realpath(target)).toLowerCase() !== target.toLowerCase())
+    throw Error('External browser directory cannot redirect through a link.');
+  return target;
+}
+
+/**
+ * Routes browser MCP calls to a deliberately selected, isolated external
+ * Chrome context. The provider sees only this gateway's loopback token; child
+ * gateways are called in-process and their profile paths stay inside K.
+ */
+export async function createExternalBrowserGateway({
+  directory,
+  profile,
+  launchExternalContext,
+  listExternalProfiles,
+  startExternalBrowser,
+  childGatewayFactory = createBrowserOwnerGateway,
+  toolTimeoutMs = 120000
+}) {
+  if (!path.isAbsolute(directory ?? '') || !path.isAbsolute(profile ?? ''))
+    throw Error('Absolute external browser directories are required.');
+  if (!Number.isInteger(toolTimeoutMs) || toolTimeoutMs < 1) throw Error('A positive tool timeout is required.');
+  const outputRoot = await realpath(directory),
+    profileRoot = await realpath(profile);
+  const children = new Map(),
+    pendingIds = new Set(),
+    activeCalls = new Map(),
+    initializedChildren = new WeakSet();
+  let selected = null,
+    closing = false,
+    closePromise,
+    host,
+    outerInitialized = null,
+    inFlight = 0,
+    dispatch = Promise.resolve();
+  const token = randomBytes(32).toString('hex');
+  let selectedProfileId = null;
+  const childKey = (mode, profileId) => (profileId ? `${mode}-${profileId}` : mode);
+  const queue = fn => {
+    const next = dispatch.then(fn, fn);
+    dispatch = next.catch(() => {});
+    return next;
+  };
+  async function child(mode, profileId = null) {
+    const key = childKey(mode, profileId);
+    if (children.has(key)) {
+      const existing = await children.get(key);
+      // A stopped or closed browser is replaced by a fresh connection when it is
+      // selected again; nothing that was interrupted is replayed.
+      if (!(await existing.getState()).recoveryRequired) return existing;
+      children.delete(key);
+      await existing.close().catch(() => {});
+    }
+    const opening = (async () => {
+      const childDirectory = await makeDir(outputRoot, `external-${key}`),
+        childProfile = await makeDir(profileRoot, `external-${key}`);
+      const gateway = await childGatewayFactory({
+        directory: childDirectory,
+        profile: childProfile,
+        ...(launchExternalContext
+          ? {
+              launchContext: (...args) =>
+                launchExternalContext({mode, profileId, profile: childProfile, ...(args[1] ?? {})})
+            }
+          : {})
+      });
+      return gateway;
+    })();
+    children.set(key, opening);
+    try {
+      const value = await opening;
+      children.set(key, value);
+      return value;
+    } catch (error) {
+      if (children.get(key) === opening) children.delete(key);
+      throw error;
+    }
+  }
+  // Where child() keeps this mode's screenshots, filename outputs and allowed uploads.
+  const filesNote = (mode, profileId) =>
+    `\nBrowser files directory for this mode: ${path.join(outputRoot, `external-${childKey(mode, profileId)}`)}\nScreenshots and filename outputs are saved there; relative ./ links in browser results point into it. Copy files there before browser_file_upload.`;
+  function current() {
+    return selected ? children.get(childKey(selected, selectedProfileId)) : null;
+  }
+  async function childInitialize(gateway, signal) {
+    if (!outerInitialized || initializedChildren.has(gateway)) return;
+    const response = await gateway.request(outerInitialized, signal);
+    await response.arrayBuffer();
+    if (!response.ok) throw Error('Browser child initialization failed.');
+    initializedChildren.add(gateway);
+  }
+  const http = createServer(async (req, res) => {
+    if (closing) {
+      res.writeHead(503).end();
+      return;
+    }
+    if (!admitMcpRequest(req, res, {host, token})) return;
+    let timer,
+      reqMessage,
+      finished = false,
+      registered = false;
+    const controller = new AbortController();
+    const cancel = () => {
+      if (!finished) controller.abort();
+    };
+    try {
+      reqMessage = JSON.parse(await readLimitedBody(req));
+      if (
+        !reqMessage ||
+        Array.isArray(reqMessage) ||
+        reqMessage.jsonrpc !== '2.0' ||
+        typeof reqMessage.method !== 'string'
+      )
+        throw Error('Invalid request.');
+      if (reqMessage.id !== undefined && !['string', 'number'].includes(typeof reqMessage.id))
+        throw Error('Invalid request ID.');
+      if (reqMessage.id !== undefined) {
+        if (pendingIds.has(reqMessage.id)) {
+          res.writeHead(409).end();
+          return;
+        }
+        pendingIds.add(reqMessage.id);
+        registered = true;
+      }
+      if (reqMessage.method === 'tools/call' && reqMessage.id === undefined)
+        throw Error('Tool calls require a request ID.');
+      if (reqMessage.method === 'tools/call') {
+        activeCalls.set(reqMessage.id, controller);
+        res.once('close', cancel);
+        timer = setTimeout(() => {
+          cancel();
+          res.destroy();
+        }, toolTimeoutMs);
+      }
+      if (reqMessage.method === 'notifications/cancelled') {
+        activeCalls.get(reqMessage.params?.requestId)?.abort();
+        res.writeHead(202).end();
+        finished = true;
+        return;
+      }
+      let result = await queue(async () => {
+        if (controller.signal.aborted) return new Response(null, {status: 202});
+        if (reqMessage.method === 'notifications/initialized') return new Response(null, {status: 202});
+        if (reqMessage.method === 'ping') return jsonResponse({jsonrpc: '2.0', id: reqMessage.id, result: {}});
+        if (reqMessage.method === 'initialize') {
+          outerInitialized = reqMessage;
+          const gateway = current();
+          if (gateway) return forward(gateway, reqMessage, controller.signal);
+          return new Response(
+            JSON.stringify({
+              jsonrpc: '2.0',
+              id: reqMessage.id,
+              result: {
+                protocolVersion: reqMessage.params?.protocolVersion ?? '2025-11-25',
+                capabilities: {tools: {}},
+                serverInfo: {name: 'k-external-browser-gateway', version: '1'}
+              }
+            }),
+            {status: 200, headers: {'Content-Type': 'application/json'}}
+          );
+        }
+        if (reqMessage.method === 'tools/list') {
+          // A dormant regular child supplies the actual SDK schemas without
+          // selecting a mode or opening Chrome. The model can then discover
+          // the full tool surface before invoking browser_session.
+          const gateway = current() ?? (await child('regular'));
+          await childInitialize(gateway, controller.signal);
+          const proxied = await forward(gateway, reqMessage, controller.signal);
+          const message = unpack(await proxied.text());
+          if (message.result?.tools) {
+            if (!message.result.tools.some(tool => tool.name === 'browser_session'))
+              message.result.tools.push(browserSessionTool);
+            if (listExternalProfiles) message.result.tools.push(browserProfilesTool);
+          }
+          return pack(proxied, message);
+        }
+        if (
+          reqMessage.method === 'tools/call' &&
+          reqMessage.params?.name === 'browser_profiles' &&
+          listExternalProfiles
+        ) {
+          try {
+            const profiles = await listExternalProfiles();
+            return jsonResponse({
+              jsonrpc: '2.0',
+              id: reqMessage.id,
+              result: {content: [{type: 'text', text: JSON.stringify({profiles})}]}
+            });
+          } catch {
+            return jsonResponse(
+              toolError(reqMessage.id, 'K Chrome 設定檔清單暫時無法讀取；沒有選擇或啟動其他瀏覽器。')
+            );
+          }
+        }
+        if (reqMessage.method === 'tools/call' && reqMessage.params?.name === 'browser_session') {
+          const mode = reqMessage.params?.arguments?.mode;
+          const requestedProfileId = reqMessage.params?.arguments?.profileId;
+          if (!MODES.has(mode))
+            return jsonResponse(rpcError(reqMessage.id, -32602, 'Choose mode regular or incognito.'));
+          if (
+            requestedProfileId !== undefined &&
+            (!listExternalProfiles ||
+              typeof requestedProfileId !== 'string' ||
+              !/^[a-f0-9]{32}$/.test(requestedProfileId))
+          )
+            return jsonResponse(rpcError(reqMessage.id, -32602, 'Choose a valid profileId from browser_profiles.'));
+          let targetProfileId = requestedProfileId ?? selectedProfileId;
+          const gateway = current();
+          if (gateway) {
+            const state = await gateway.getState();
+            if (inFlight || state.busy)
+              return jsonResponse(
+                toolError(reqMessage.id, 'Cannot switch browser mode while a browser operation is active.')
+              );
+            if (!state.recoveryRequired && mode === selected && targetProfileId === selectedProfileId)
+              return jsonResponse({
+                jsonrpc: '2.0',
+                id: reqMessage.id,
+                result: {
+                  content: [
+                    {
+                      type: 'text',
+                      text: `External Chrome ${mode} mode is already selected.${selectedProfileId ? ` profileId=${selectedProfileId}` : ''}${filesNote(mode, selectedProfileId)}`
+                    }
+                  ]
+                }
+              });
+          }
+          // A failed explicit selection must not leave the previous mode as
+          // an implicit fallback target.
+          selected = null;
+          selectedProfileId = null;
+          let target;
+          try {
+            if (listExternalProfiles) {
+              let profiles = await listExternalProfiles();
+              if (startExternalBrowser && targetProfileId) {
+                // A requested or pinned profile is opened itself, even while other
+                // profiles are connected; never another profile in its place.
+                const known = profiles.find(p => p.profileId === targetProfileId);
+                if (!known) throw Error('Unknown profileId; use browser_profiles. No other profile was opened.');
+                if (!known.connected)
+                  profiles = await startExternalBrowser({signal: controller.signal, profileId: targetProfileId});
+              } else if (startExternalBrowser && !profiles.some(p => p.connected))
+                // Nothing connected means K Chrome is not running: start it minimized
+                // rather than asking the owner to open it (owner decision 2026-10-18).
+                profiles = await startExternalBrowser({signal: controller.signal});
+              const online = profiles.filter(p => p.connected);
+              if (!targetProfileId) {
+                if (online.length !== 1)
+                  throw Error('Use browser_profiles and specify profileId; no unique connected profile.');
+                targetProfileId = online[0].profileId;
+              }
+              const chosen = profiles.find(p => p.profileId === targetProfileId && p.connected);
+              if (!chosen || !chosen.modes.includes(mode))
+                throw Error('The requested Chrome profile or mode is unavailable.');
+            }
+            target = await child(mode, targetProfileId);
+            await childInitialize(target, controller.signal);
+            // Make browser_session mean an actually connected session, rather
+            // than merely remembering a preference. This uses the SDK's
+            // harmless state read and never falls back to another mode.
+            const warm = unpack(
+              await (
+                await forward(
+                  target,
+                  {
+                    jsonrpc: '2.0',
+                    id: `external-session-${mode}`,
+                    method: 'tools/call',
+                    params: {name: 'browser_snapshot', arguments: {}}
+                  },
+                  controller.signal
+                )
+              ).text()
+            );
+            const detail =
+              warm.error?.message ??
+              (warm.result?.isError ? warm.result.content?.find(item => item.type === 'text')?.text : null);
+            if (warm.error || warm.result?.isError)
+              throw Error(detail || 'External browser session did not become ready.');
+          } catch (error) {
+            selected = null;
+            selectedProfileId = null;
+            if (target) {
+              await target.close().catch(() => {});
+              const key = childKey(mode, targetProfileId);
+              if (children.get(key) === target) children.delete(key);
+            }
+            return jsonResponse(
+              toolError(
+                reqMessage.id,
+                `Could not open external Chrome ${mode} mode: ${String(error?.message ?? 'session startup failed').slice(0, 300)}. No fallback was selected.`
+              )
+            );
+          }
+          selected = mode;
+          selectedProfileId = targetProfileId;
+          return jsonResponse({
+            jsonrpc: '2.0',
+            id: reqMessage.id,
+            result: {
+              content: [
+                {
+                  type: 'text',
+                  text: `Selected external Chrome ${mode} mode.${selectedProfileId ? ` profileId=${selectedProfileId}` : ''}${filesNote(mode, selectedProfileId)}`
+                }
+              ]
+            }
+          });
+        }
+        const gateway = current();
+        if (reqMessage.method === 'tools/call' && !gateway)
+          return jsonResponse(
+            toolError(
+              reqMessage.id,
+              'Select browser_session mode regular or incognito before using browser tools. A failed browser_session call clears the previous selection.'
+            )
+          );
+        if (!gateway) return jsonResponse(rpcError(reqMessage.id, -32002, 'Select a browser mode first.'));
+        if (reqMessage.method === 'tools/call') inFlight++;
+        return forward(
+          gateway,
+          reqMessage,
+          controller.signal,
+          reqMessage.method === 'tools/call'
+            ? () => {
+                inFlight = Math.max(0, inFlight - 1);
+              }
+            : undefined
+        );
+      });
+      if (result instanceof Response) {
+        res.writeHead(result.status, Object.fromEntries(result.headers));
+        res.flushHeaders();
+        if (result.body) await pipeline(Readable.fromWeb(result.body), res);
+        else res.end();
+      } else res.end();
+      finished = true;
+    } catch {
+      if (!res.headersSent)
+        res
+          .writeHead(400, {'Content-Type': 'application/json'})
+          .end(JSON.stringify(rpcError(reqMessage?.id, -32600, 'Invalid browser MCP request.')));
+      else res.destroy();
+    } finally {
+      clearTimeout(timer);
+      res.off('close', cancel);
+      // Only the request that claimed the ID releases it; a refused duplicate
+      // must not free the ID of the call still running.
+      if (registered) {
+        pendingIds.delete(reqMessage.id);
+        activeCalls.delete(reqMessage.id);
+        controller.abort();
+      }
+    }
+  });
+  async function forward(gateway, message, signal, onDone) {
+    let response;
+    try {
+      response = await gateway.request(message, signal);
+    } catch (error) {
+      onDone?.();
+      throw error;
+    }
+    if (!onDone) return response;
+    if (!response.body) {
+      onDone();
+      return response;
+    }
+    const reader = response.body.getReader();
+    let released = false;
+    const finish = () => {
+      if (!released) {
+        released = true;
+        onDone();
+      }
+    };
+    const body = new ReadableStream({
+      async pull(controller) {
+        try {
+          const item = await reader.read();
+          if (item.done) {
+            finish();
+            controller.close();
+          } else controller.enqueue(item.value);
+        } catch (error) {
+          finish();
+          controller.error(error);
+        }
+      },
+      async cancel(reason) {
+        finish();
+        await reader.cancel(reason);
+      }
+    });
+    return new Response(body, {status: response.status, statusText: response.statusText, headers: response.headers});
+  }
+  function jsonResponse(message) {
+    return new Response(JSON.stringify(message), {status: 200, headers: {'Content-Type': 'application/json'}});
+  }
+  function toolError(id, message) {
+    return {jsonrpc: '2.0', id, result: {isError: true, content: [{type: 'text', text: message}]}};
+  }
+  async function close() {
+    if (closePromise) return closePromise;
+    closing = true;
+    closePromise = (async () => {
+      http.closeAllConnections();
+      await new Promise(resolve => http.close(() => resolve()));
+      const values = await Promise.allSettled([...children.values()].map(async item => (await item).close()));
+      const errors = values.filter(item => item.status === 'rejected').map(item => item.reason);
+      if (errors.length) throw new AggregateError(errors, 'External browser shutdown was not confirmed.');
+    })();
+    return closePromise;
+  }
+  await new Promise((resolve, reject) => {
+    http.once('error', reject);
+    http.listen(0, '127.0.0.1', resolve);
+  });
+  host = `127.0.0.1:${http.address().port}`;
+  return {
+    aiMcpServer: {type: 'http', url: `http://${host}/mcp`, headers: {Authorization: `Bearer ${token}`}},
+    async getState() {
+      const gateway = current();
+      if (!gateway)
+        return {available: false, busy: inFlight > 0, external: true, selectedMode: null, browserMode: null};
+      const state = await gateway.getState();
+      return {
+        ...state,
+        busy: state.busy || inFlight > 0,
+        external: true,
+        selectedMode: selected,
+        browserMode: selected,
+        ...(selectedProfileId ? {profileId: selectedProfileId} : {})
+      };
+    },
+    close
+  };
+}

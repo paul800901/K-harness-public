@@ -1,0 +1,300 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {mkdtemp, mkdir, rm, writeFile} from 'node:fs/promises';
+import path from 'node:path';
+import {fileURLToPath} from 'node:url';
+import {createClaudeController} from '../src/claude-controller.mjs';
+import {globalRulesPath} from '../src/common-memory.mjs';
+import {listMainSessions} from '../src/main-sessions.mjs';
+import {scratchBase} from './scratch.mjs';
+
+const TEST_ROOT = scratchBase;
+const CLAUDE_MODEL = 'claude-opus-5-5';
+
+async function fixture({bridgeFactory, gatewayFactory, roomTools} = {}) {
+  await mkdir(TEST_ROOT, {recursive: true});
+  const root = await mkdtemp(path.join(TEST_ROOT, 'claude-boundaries-'));
+  const hosts = [],
+    bridges = [];
+  const controller = createClaudeController({
+    root,
+    roomTools,
+    hostFactory: async options => {
+      let resolveClosed;
+      const host = {
+        options,
+        starts: [],
+        closeCount: 0,
+        interruptCount: 0,
+        closed: new Promise(resolve => {
+          resolveClosed = resolve;
+        }),
+        async start(content) {
+          this.starts.push(structuredClone(content));
+        },
+        async interrupt() {
+          this.interruptCount++;
+        },
+        async close() {
+          this.closeCount++;
+          resolveClosed();
+        }
+      };
+      hosts.push(host);
+      return host;
+    },
+    gatewayFactory: gatewayFactory ?? (async () => ({mcpConfig: {mcpServers: {}}, close: async () => {}})),
+    bridgeFactory:
+      bridgeFactory ??
+      (async options => {
+        const bridge = {
+          options,
+          async list() {
+            return [];
+          },
+          async close() {}
+        };
+        bridges.push(bridge);
+        return bridge;
+      })
+  });
+  return {root, controller, hosts, bridges};
+}
+
+test('opening Claude initializes the gateway without starting the lazy Luna bridge', async () => {
+  let gatewayCalls = 0,
+    bridgeCalls = 0,
+    gatewayBridge;
+  const answers = [];
+  const f = await fixture({
+    gatewayFactory: async ({bridge}) => {
+      gatewayCalls++;
+      gatewayBridge = bridge;
+      return {mcpConfig: {mcpServers: {}}, close: async () => {}};
+    },
+    bridgeFactory: async () => {
+      bridgeCalls++;
+      return {
+        async start() {},
+        async answer(args) {
+          answers.push(args);
+          return {requestId: args.requestId, settled: false};
+        },
+        async list() {
+          return [];
+        },
+        async close() {}
+      };
+    }
+  });
+  try {
+    await f.controller.open({model: CLAUDE_MODEL});
+    assert.equal(gatewayCalls, 1);
+    assert.equal(bridgeCalls, 0);
+    assert.equal(f.hosts.length, 1);
+    const args = {requestId: 'worker', questionId: 'question', answer: 'Use sample A'};
+    await assert.rejects(gatewayBridge.answer(args), /沒有可回覆/);
+    assert.equal(bridgeCalls, 0);
+    await gatewayBridge.start({requestId: args.requestId});
+    assert.equal((await gatewayBridge.answer(args)).requestId, args.requestId);
+    const stopping = f.controller.stop();
+    await assert.rejects(gatewayBridge.answer(args), /沒有可回覆/);
+    await stopping;
+    await assert.rejects(gatewayBridge.answer(args), /沒有可回覆/);
+    assert.equal(bridgeCalls, 1);
+    assert.deepEqual(answers, [args]);
+  } finally {
+    await f.controller.close();
+  }
+});
+
+test("room tools reach the Claude main gateway and answer only during this room's running turn", async () => {
+  let rooms;
+  const calls = [];
+  const f = await fixture({
+    roomTools: {
+      list: async id => calls.push(['list', id]) && {rooms: []},
+      note: async (id, args) => calls.push(['note', id, args]) && {queued: true}
+    },
+    gatewayFactory: async options => {
+      rooms = options.rooms;
+      return {mcpConfig: {mcpServers: {}}, close: async () => {}};
+    }
+  });
+  try {
+    await f.controller.open({model: CLAUDE_MODEL});
+    assert.throws(() => rooms.list(), /進行中回合/);
+    await f.controller.send({text: 'go'});
+    assert.equal(f.controller.state.busy, true);
+    await rooms.list();
+    await rooms.note({targetThreadId: 'room-b', text: 'hi'});
+    const id = f.controller.state.threadId;
+    assert.deepEqual(calls, [
+      ['list', id],
+      ['note', id, {targetThreadId: 'room-b', text: 'hi'}]
+    ]);
+    f.hosts[0].options.onMessage({type: 'result', is_error: false});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.controller.state.busy, false);
+    assert.throws(() => rooms.list(), /進行中回合/);
+    assert.throws(() => rooms.note({targetThreadId: 'room-b', text: 'late'}), /進行中回合/);
+    assert.equal(calls.length, 2);
+  } finally {
+    await f.controller.close();
+  }
+});
+
+test('failed reopen teardown retains the old host and retry closes it without sending', async () => {
+  let fail = true,
+    closes = 0;
+  const f = await fixture({
+    gatewayFactory: async () => ({
+      mcpConfig: {mcpServers: {}},
+      async close() {
+        closes++;
+        if (fail) throw Error('cleanup blocked');
+      }
+    })
+  });
+  await f.controller.open({model: CLAUDE_MODEL});
+  const id = f.controller.state.threadId,
+    old = f.hosts[0];
+  await assert.rejects(f.controller.open({threadId: id}), /cleanup blocked/);
+  assert.equal(closes, 1);
+  assert.equal(old.closeCount, 0);
+  assert.equal(f.hosts.length, 1);
+  assert.equal(f.controller.state.status, 'uncertain');
+  assert.equal(f.controller.state.threadId, id);
+  fail = false;
+  await f.controller.open({threadId: id});
+  assert.equal(old.closeCount, 1);
+  assert.equal(f.hosts.length, 2);
+  assert.equal(f.controller.state.status, 'ready');
+  assert.equal(f.controller.state.threadId, id);
+  assert.ok(f.hosts.every(host => host.starts.length === 0));
+  await f.controller.close();
+});
+
+test('native plan mode is passed to Claude; K does not impose a second tool allowlist', async () => {
+  const f = await fixture();
+  try {
+    await f.controller.open({model: CLAUDE_MODEL, accessMode: 'read-only'});
+    assert.equal(f.hosts[0].options.accessMode, 'claude-plan');
+    const permission = f.hosts[0].options.onPermission;
+    const command = permission({toolName: 'Bash', input: {command: 'echo unsafe'}});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.controller.state.questions[0].details.toolName, 'Bash');
+    await f.controller.answer({id: f.controller.state.questions[0].id, accept: false});
+    assert.equal((await command).behavior, 'deny');
+  } finally {
+    await f.controller.close();
+  }
+});
+
+test('all official native Claude permission modes are accepted without rewriting', async () => {
+  const f = await fixture();
+  try {
+    for (const mode of [
+      'claude-manual',
+      'claude-acceptEdits',
+      'claude-auto',
+      'claude-bypassPermissions',
+      'claude-dontAsk',
+      'claude-plan'
+    ]) {
+      await f.controller.open({model: CLAUDE_MODEL, accessMode: mode, permissionConfirmed: mode === 'claude-bypassPermissions'});
+      assert.equal(f.hosts.at(-1).options.accessMode, mode);
+      await f.controller.close();
+    }
+  } finally {
+    await f.controller.close();
+  }
+});
+
+test('Claude native manual approval is not silently restricted to workspace paths', async () => {
+  const f = await fixture();
+  try {
+    await f.controller.open({model: CLAUDE_MODEL, accessMode: 'workspace-write'});
+    const pending = f.hosts[0].options.onPermission({
+      toolName: 'Write',
+      input: {file_path: path.join(f.root, '..', 'outside.txt'), content: 'x'}
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.controller.state.questions[0].details.input.file_path, path.join(f.root, '..', 'outside.txt'));
+    await f.controller.answer({id: f.controller.state.questions[0].id, accept: false});
+    assert.equal((await pending).behavior, 'deny');
+  } finally {
+    await f.controller.close();
+  }
+});
+
+test('Claude conversations are included in the common main-session listing', async () => {
+  const f = await fixture();
+  try {
+    const opened = await f.controller.open({model: CLAUDE_MODEL});
+    const [common, visible] = await Promise.all([listMainSessions(f.root), f.controller.sessions()]);
+    assert.equal(
+      common.sessions.some(session => session.threadId === opened.threadId && session.provider === 'claude'),
+      true
+    );
+    assert.equal(
+      visible.sessions.some(session => session.threadId === opened.threadId && session.provider === 'claude'),
+      true
+    );
+  } finally {
+    await f.controller.close();
+  }
+});
+
+test('confirmed stop reconnects the same conversation on new send without replaying old input', async () => {
+  const f = await fixture();
+  const rules = globalRulesPath(f.root);
+  await mkdir(path.dirname(rules), {recursive: true});
+  await writeFile(rules, '- Claude 合成舊規則');
+  try {
+    const opened = await f.controller.open({model: CLAUDE_MODEL});
+    const oldHost = f.hosts[0];
+    await f.controller.send({text: '正在處理的舊工作'});
+    await f.controller.stop();
+    assert.equal(oldHost.closeCount, 1);
+    assert.equal(oldHost.interruptCount, 1);
+    assert.equal(oldHost.starts.length, 1);
+    assert.match(oldHost.starts[0][0].text, /<k_global_rules>[\s\S]*Claude 合成舊規則/);
+    await rm(rules);
+    await f.controller.send({text: '重新開啟後才送出的新 prompt'});
+    const newHost = f.hosts[1];
+    assert.notEqual(newHost, oldHost);
+    assert.equal(f.controller.state.threadId, opened.threadId);
+    assert.equal(oldHost.starts.length, 1);
+    assert.equal(newHost.options.resume, true);
+    assert.equal(newHost.starts.length, 1);
+    assert.match(newHost.starts[0][0].text, /^<k_common_memory>/);
+    assert.match(newHost.starts[0][0].text, /<k_global_rules>[\s\S]*目前未啟用（檔案不存在[\s\S]*均已失效/);
+    assert.equal(newHost.starts[0][1].text, '重新開啟後才送出的新 prompt');
+  } finally {
+    await f.controller.close();
+  }
+});
+
+test('uncertain stop does not reconnect or send a new prompt automatically', async () => {
+  let fail = false;
+  const f = await fixture({
+    gatewayFactory: async () => ({
+      mcpConfig: {mcpServers: {}},
+      async close() {
+        if (fail) throw Error('cleanup uncertain');
+      }
+    })
+  });
+  try {
+    await f.controller.open({model: CLAUDE_MODEL});
+    fail = true;
+    await assert.rejects(f.controller.stop(), /cleanup uncertain/);
+    await assert.rejects(f.controller.send({text: 'must not send'}), /請先開啟/);
+    assert.equal(f.hosts.length, 1);
+    assert.equal(f.hosts[0].starts.length, 0);
+  } finally {
+    fail = false;
+    await f.controller.close();
+  }
+});

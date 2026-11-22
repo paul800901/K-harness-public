@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background android:drawable="@color/icon_background" />
+    <!-- The full K emblem sits inside the always-visible 72dp of the 108dp layer. -->
+    <foreground>
+        <inset android:drawable="@drawable/k_icon" android:inset="18dp" />
+    </foreground>
+</adaptive-icon>

@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- The K page has no dark mode; keep the same light look as the page. -->
+    <style name="AppTheme" parent="@android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:colorPrimary">#2B241D</item>
+        <item name="android:colorAccent">#9A7630</item>
+        <item name="android:statusBarColor">#F2ECE2</item>
+        <item name="android:navigationBarColor">#F2ECE2</item>
+        <item name="android:windowLightStatusBar">true</item>
+        <item name="android:windowLightNavigationBar">true</item>
+        <item name="android:windowBackground">@color/page</item>
+    </style>
+    <color name="page">#FBF7F0</color>
+    <color name="icon_background">#FDF5EC</color>
+</resources>

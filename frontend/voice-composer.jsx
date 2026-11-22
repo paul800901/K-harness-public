@@ -1,0 +1,396 @@
+import React, {useEffect, useRef, useState, useSyncExternalStore} from 'react';
+import {WebSpeechDictationAdapter} from '@assistant-ui/react';
+import {createDictationSession} from './dictation-session.mjs';
+import {createNativeDictationSession} from './native-dictation.mjs';
+import {AppContext} from './app-common.jsx';
+import {microphone} from './voice-call.mjs';
+
+// Only stopped, in-flight main-composer transcripts outlive their room's view or a hidden window,
+// keeping the stop/send intent chosen in that room. A main-composer recording whose transcription
+// failed stays in memory for that room until the person recognizes it again, cancels or records anew;
+// nothing retries by itself.
+const backgroundTranscriptions = new Map(),
+  backgroundNotices = new Map(),
+  retainedRecordings = new Map();
+
+// Capture stays in memory. Native audio is sent only to K's local transcription endpoint.
+function paintWaveform(canvas, levels) {
+  if (!canvas) return;
+  const width = canvas.clientWidth,
+    height = 32,
+    ratio = window.devicePixelRatio || 1;
+  if (!width) return;
+  canvas.width = width * ratio;
+  canvas.height = height * ratio;
+  const ctx = canvas.getContext('2d');
+  ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+  ctx.fillStyle = getComputedStyle(canvas).color;
+  levels.forEach((level, i) => {
+    const h = Math.max(2, level * height);
+    ctx.fillRect((i * width) / levels.length, (height - h) / 2, 2, h);
+  });
+}
+
+export function useVoiceComposer({onResult, onBackgroundResult, disabled: blocked, onActiveChange = () => {}, sessionKey}) {
+  // A voice call holds the microphone; dictation waits until it is hung up.
+  const callActive = useSyncExternalStore(microphone.subscribe, microphone.snapshot).call,
+    disabled = blocked || callActive,
+    owner = useRef({});
+  useEffect(() => () => microphone.dictation(owner.current, false), []);
+  const [phase, setPhaseState] = useState('idle'),
+    [notice, setNotice] = useState(''),
+    [consent, setConsent] = useState(false),
+    [hasRetained, setHasRetained] = useState(false);
+  const canvas = useRef(null),
+    job = useRef(null),
+    callback = useRef(onResult),
+    background = useRef(onBackgroundResult),
+    activity = useRef(onActiveChange),
+    scope = useRef(sessionKey);
+  callback.current = onResult;
+  background.current = onBackgroundResult;
+  activity.current = onActiveChange;
+  scope.current = sessionKey;
+  const remote = typeof document !== 'undefined' && document.documentElement.dataset.kRemote === 'true';
+  const desktop = typeof window !== 'undefined' && typeof window.kBrowser?.onWindowHidden === 'function';
+  const native = desktop || remote; // Both capture this device and use the computer's local recognizer, never Web Speech.
+  const app = React.useContext(AppContext);
+  const needsSetup = native && app?.state?.dictationConfigured !== true;
+  const consentKey = 'k-browser-dictation-consent';
+  const setPhase = next => {
+    setPhaseState(next);
+    microphone.dictation(owner.current, next !== 'idle');
+    activity.current?.(next !== 'idle');
+  };
+  const release = entry => {
+    cancelAnimationFrame(entry.frame);
+    entry.stream?.getTracks().forEach(track => track.stop());
+    entry.context?.close().catch(() => {});
+    entry.stream = null;
+    entry.context = null;
+  };
+  const cancel = () => {
+    const entry = job.current;
+    if (entry) {
+      job.current = null;
+      entry.view = null;
+      if (backgroundTranscriptions.get(entry.scope) === entry) backgroundTranscriptions.delete(entry.scope);
+      entry.session?.cancel();
+      release(entry);
+    }
+    if (onBackgroundResult) retainedRecordings.delete(scope.current);
+    setHasRetained(false);
+    setPhase('idle');
+    setNotice('已取消這段聽寫，原草稿保留。');
+  };
+  const attach = entry => {
+    entry.view = {
+      retained: () => {
+        if (entry.scope === scope.current) setHasRetained(retainedRecordings.has(scope.current));
+      },
+      state: next => {
+        if (job.current === entry && entry.scope === scope.current) setPhase(next);
+      },
+      notice: message => {
+        entry.notice = message;
+        if (job.current === entry && entry.scope === scope.current) setNotice(message);
+      },
+      finish: (result, error) => {
+        if (job.current !== entry || entry.scope !== scope.current) return false;
+        job.current = null;
+        setPhase('idle');
+        if (error) setNotice(`${error} 未送出；原草稿保留。`);
+        else if (!result.text.trim()) setNotice('沒有辨識到文字，未送出訊息。');
+        else {
+          callback.current(remote ? {...result, send: false} : result);
+          if (entry.hitLimit) setNotice('已達 5 分鐘上限；辨識已完成。');
+        }
+        return true;
+      }
+    };
+  };
+  const finishNative = (entry, result, error, failed) => {
+    if (backgroundTranscriptions.get(entry.scope) === entry) backgroundTranscriptions.delete(entry.scope);
+    const view = entry.view;
+    entry.view = null;
+    release(entry);
+    // Only the main composer keeps a failed recording; a quote annotation shares the room key.
+    if (error && failed?.audioBase64 && entry.backgroundResult) {
+      retainedRecordings.set(entry.scope, {audioBase64: failed.audioBase64, send: failed.send});
+      view?.retained();
+    }
+    if (view?.finish(result, error)) return;
+    if (!entry.backgroundResult) return;
+    if (error) backgroundNotices.set(entry.scope, `${error} 未送出；原草稿保留。`);
+    else if (!result.text.trim()) backgroundNotices.set(entry.scope, '沒有辨識到文字，未送出訊息。');
+    else
+      void Promise.resolve(entry.backgroundResult(remote ? {...result, send: false} : result)).then(message => {
+        if (message) backgroundNotices.set(entry.scope, message);
+      });
+  };
+  // Hiding the window/page ends capture (no hidden microphone) but keeps what was said: it is
+  // transcribed into the draft without sending. A microphone still starting is canceled so a late
+  // stream never begins recording while hidden. A stopped transcription simply continues.
+  const stopHiddenRecording = () => {
+    const state = job.current?.session?.getState();
+    if (state === 'starting') cancel();
+    else if (state === 'recording') void job.current.session.stop(false);
+  };
+  const hiddenRef = useRef(stopHiddenRecording);
+  hiddenRef.current = stopHiddenRecording;
+  useEffect(() => {
+    if (!desktop) return;
+    return window.kBrowser.onWindowHidden(() => hiddenRef.current());
+  }, [desktop]);
+  useEffect(() => {
+    if (!remote) return;
+    const hidden = () => {
+      if (document.hidden) hiddenRef.current();
+    };
+    document.addEventListener('visibilitychange', hidden);
+    return () => document.removeEventListener('visibilitychange', hidden);
+  }, [remote]);
+  useEffect(() => {
+    const pending = onBackgroundResult ? backgroundTranscriptions.get(sessionKey) : null;
+    if (pending) {
+      job.current = pending;
+      attach(pending);
+      setPhase(pending.session.getState());
+      setNotice(
+        pending.notice ??
+          (pending.send && !remote
+            ? '轉錄完成後會在此聊天室送出。'
+            : '轉錄完成後會留在此聊天室草稿，不會自動送出。')
+      );
+    }
+    if (onBackgroundResult && backgroundNotices.has(sessionKey)) {
+      setNotice(backgroundNotices.get(sessionKey));
+      backgroundNotices.delete(sessionKey);
+    }
+    setHasRetained(Boolean(onBackgroundResult) && retainedRecordings.has(sessionKey));
+    return () => {
+      const entry = job.current;
+      job.current = null;
+      if (entry) {
+        entry.view = null;
+        // Leaving the room while recording ends capture; its audio becomes a draft-only transcript.
+        if (entry.backgroundResult && entry.session?.getState() === 'recording') void entry.session.stop(false);
+        if (entry.backgroundResult && entry.session?.getState() === 'transcribing') {
+          // The room's latest callback carries its own draft, attachments, quotes and send settings.
+          entry.backgroundResult = background.current;
+          backgroundTranscriptions.set(entry.scope, entry);
+        } else {
+          entry.session?.cancel();
+          release(entry);
+        }
+      }
+      activity.current?.(false);
+    };
+  }, [sessionKey]);
+  const post = (url, body, signal) =>
+    fetch(url, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-K-Request': '1',
+        ...(remote ? {'X-K-Command': crypto.randomUUID()} : {})
+      },
+      body: JSON.stringify(body),
+      signal
+    });
+  const beginNative = phase => {
+    const entry = {scope: scope.current, levels: Array(70).fill(0), backgroundResult: onBackgroundResult};
+    job.current = entry;
+    attach(entry);
+    setPhase(phase);
+    setNotice('');
+    const current = () => job.current === entry && entry.scope === scope.current;
+    entry.session = createNativeDictationSession({
+      ...(remote ? {createAudioContext: () => new AudioContext()} : {}),
+      prepareTranscription: (signal, id) => post('/api/dictation/prepare', {id}, signal),
+      requestTranscription: async (audioBase64, signal, id) => {
+        const response = await post('/api/dictation/transcribe', {id, audioBase64}, signal);
+        const payload = await response.json();
+        if (!response.ok) throw new Error(payload?.error || '本機語音辨識失敗。');
+        return payload;
+      },
+      onState: state => entry.view?.state(state),
+      onLevel: level => {
+        if (current()) {
+          entry.levels.shift();
+          entry.levels.push(Math.min(1, level * 5));
+        }
+      },
+      onLimit: () => {
+        entry.hitLimit = true;
+        entry.view?.notice('已達 5 分鐘上限，正在轉錄；完成後不會自動送出。');
+      },
+      onResult: result => finishNative(entry, result, null),
+      onError: (message, failed) => finishNative(entry, null, message, failed)
+    });
+    return entry;
+  };
+  const start = async () => {
+    if (disabled || job.current) return;
+    if (needsSetup) {
+      setNotice('本機聽寫尚未設定。可選 Windows 語音辨識或離線 Whisper。請查看 README 的「本機聽寫」，也可以請你的 AI 協助設定。');
+      activity.current?.(false);
+      return;
+    }
+    if (!native && sessionStorage.getItem(consentKey) !== 'yes') {
+      setConsent(true);
+      activity.current?.(false);
+      return;
+    }
+    if (native) {
+      if (onBackgroundResult) retainedRecordings.delete(scope.current);
+      setHasRetained(false);
+      if (typeof navigator === 'undefined' || typeof navigator.mediaDevices?.getUserMedia !== 'function') {
+        setNotice('目前無法存取此裝置的麥克風；原草稿保留。');
+        activity.current?.(false);
+        return;
+      }
+      const entry = beginNative('starting');
+      void entry.session.start().then(() => {
+        const draw = () => {
+          if (job.current !== entry || entry.session.getState() !== 'recording') return;
+          paintWaveform(canvas.current, entry.levels);
+          entry.frame = requestAnimationFrame(draw);
+        };
+        draw();
+      });
+      return;
+    }
+    if (!WebSpeechDictationAdapter.isSupported() || !navigator.mediaDevices?.getUserMedia) {
+      setNotice('目前瀏覽器不支援內建聽寫。請使用支援語音辨識的瀏覽器；仍可手動按 Win+H 輸入。');
+      activity.current?.(false);
+      return;
+    }
+    const entry = {scope: scope.current};
+    job.current = entry;
+    setPhase('starting');
+    setNotice('');
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({audio: true});
+      if (job.current !== entry) {
+        stream.getTracks().forEach(track => track.stop());
+        return;
+      }
+      entry.stream = stream;
+      const context = new AudioContext();
+      entry.context = context;
+      await context.resume();
+      if (job.current !== entry) return;
+      const analyser = context.createAnalyser();
+      analyser.fftSize = 256;
+      context.createMediaStreamSource(stream).connect(analyser);
+      const data = new Uint8Array(analyser.fftSize),
+        levels = Array(70).fill(0);
+      const draw = () => {
+        if (job.current !== entry || !entry.stream) return;
+        analyser.getByteTimeDomainData(data);
+        const rms = Math.sqrt(data.reduce((sum, v) => sum + ((v - 128) / 128) ** 2, 0) / data.length);
+        levels.shift();
+        levels.push(Math.min(1, rms * 5));
+        paintWaveform(canvas.current, levels);
+        entry.frame = requestAnimationFrame(draw);
+      };
+      const finish = () => {
+        if (job.current !== entry) return false;
+        const sameScope = entry.scope === scope.current;
+        job.current = null;
+        release(entry);
+        setPhase('idle');
+        return sameScope;
+      };
+      entry.session = createDictationSession({
+        adapter: new WebSpeechDictationAdapter({language: 'zh-TW', continuous: true, interimResults: true}),
+        onState: state => {
+          if (job.current === entry && entry.scope === scope.current) {
+            setPhase(state);
+            if (state === 'transcribing') release(entry);
+          }
+        },
+        onResult: result => {
+          if (!finish()) return;
+          if (!result.text.trim()) {
+            setNotice('沒有辨識到文字，未送出訊息。');
+            return;
+          }
+          callback.current(result);
+        },
+        onError: (message, text) => {
+          if (!finish()) return;
+          if (text?.trim()) callback.current({text, send: false});
+          setNotice(`${message} 未自動送出；原草稿保留。`);
+        }
+      });
+      entry.session.start();
+      draw();
+    } catch {
+      if (job.current === entry) {
+        job.current = null;
+        entry.session?.cancel();
+        release(entry);
+        setPhase('idle');
+        setNotice('無法啟動收音或辨識。請檢查麥克風權限、裝置與瀏覽器支援；原草稿保留。');
+      }
+    }
+  };
+  const stop = send => {
+    const entry = job.current;
+    if (!entry?.session) return;
+    entry.send ||= Boolean(send);
+    return entry.session.stop(send);
+  };
+  // Recognizes the room's failed recording again through the same session lifecycle as a fresh one,
+  // so leaving the room, cancel and background delivery behave the same.
+  const retry = () => {
+    const retained = retainedRecordings.get(scope.current);
+    if (disabled || !retained || job.current) return;
+    retainedRecordings.delete(scope.current);
+    setHasRetained(false);
+    const entry = beginNative('transcribing');
+    entry.send = retained.send;
+    void entry.session.retry(retained.audioBase64, retained.send);
+  };
+
+  return {
+    phase,
+    notice,
+    canvas,
+    start,
+    stop,
+    cancel,
+    consent,
+    native,
+    consentKey,
+    needsSetup,
+    decline: () => setConsent(false),
+    accept: () => {
+      sessionStorage.setItem(consentKey, 'yes');
+      setConsent(false);
+      void start();
+    },
+    active: phase !== 'idle',
+    callActive,
+    canRetry: hasRetained && phase === 'idle',
+    retry
+  };
+}
+
+export function VoiceWaveform({voice}) {
+  return (
+    <div className="voice-waveform" role="status" aria-live="polite">
+      {voice.phase === 'recording' ? (
+        <>
+          <canvas ref={voice.canvas} aria-hidden="true" />
+          <span className="sr-only">正在聽寫</span>
+        </>
+      ) : (
+        <span>{voice.phase === 'starting' ? '正在啟動麥克風…' : '轉錄中…'}</span>
+      )}
+    </div>
+  );
+}

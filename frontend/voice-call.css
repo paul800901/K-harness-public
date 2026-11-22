@@ -1,0 +1,86 @@
+/* The call panel writes its real height here while it is shown; the secretary room keeps that much room. */
+:root{--voice-call-panel-height:340px}
+.voice-call-button{flex:none;min-height:34px;padding:6px 12px;border:1px solid var(--k-line-strong);background:var(--k-raised);color:var(--k-ink);font-size:var(--k-text-sm);font-weight:700;border-radius:999px;box-shadow:var(--k-shadow-1)}
+.voice-call-button:hover:not(:disabled){background:var(--k-hover);border-color:var(--k-brass-line)}
+.voice-call-button svg{color:var(--k-brass)}
+.voice-call-button.active{background:var(--k-danger);border-color:var(--k-danger);color:var(--k-sheet)}
+.voice-call-button.active svg{color:var(--k-sheet)}
+.voice-call-button.active:hover:not(:disabled){background:var(--k-danger-strong)}
+.schedule-page-header .voice-call-button{margin-left:auto}
+
+.voice-call-panel{position:fixed;right:24px;top:72px;z-index:70;width:min(360px,calc(100vw - 32px));max-height:calc(100dvh - 140px);overflow-y:auto;display:flex;flex-direction:column;gap:10px;padding:16px;border:1px solid var(--k-line-strong);border-radius:var(--k-radius-lg);background:var(--k-raised);box-shadow:var(--k-shadow-3);font-size:var(--k-text-sm);color:var(--k-ink)}
+.voice-call-panel>header{display:flex;align-items:center;justify-content:space-between;gap:12px;height:auto;padding:0}
+.voice-call-panel>header strong{font-size:var(--k-text-md)}
+.voice-call-status{display:inline-flex;align-items:center;gap:7px;color:var(--k-ink-2);font-size:var(--k-text-sm)}
+.voice-call-status i{width:8px;height:8px;border-radius:50%;background:var(--k-ink-3)}
+.phase-listening .voice-call-status i{background:var(--k-ok)}
+.phase-speaking .voice-call-status i,.phase-thinking .voice-call-status i{background:var(--k-brass)}
+.phase-connecting .voice-call-status i,.phase-reconnecting .voice-call-status i{background:var(--k-warn)}
+.voice-call-cost{color:var(--k-ink-3);font-size:var(--k-text-xs)}
+.voice-call-sent{display:flex;flex-direction:column;gap:6px;padding:10px 12px;border:1px solid var(--k-line);border-radius:var(--k-radius-sm);background:var(--k-sunken)}
+.voice-call-sent-title{font-weight:700;overflow-wrap:anywhere}
+.voice-call-sent-text{white-space:pre-wrap;overflow-wrap:anywhere;max-height:160px;overflow-y:auto;line-height:1.6;user-select:text}
+.voice-call-notice{padding:8px 10px;border:1px solid var(--k-warn);border-radius:var(--k-radius-sm);background:var(--k-warn-wash);color:var(--k-warn);font-size:var(--k-text-xs);line-height:1.5}
+.voice-call-hint{color:var(--k-ink-3);font-size:var(--k-text-xs);line-height:1.5}
+.voice-call-actions{display:flex;justify-content:flex-end}
+.voice-call-controls{display:flex;flex-wrap:wrap;gap:8px}
+.voice-call-controls>button,.voice-call-volume>button{display:inline-flex;align-items:center;justify-content:center;gap:6px;min-height:40px;padding:6px 12px;border:1px solid var(--k-line-strong);border-radius:999px;background:var(--k-raised);color:var(--k-ink);font-weight:700}
+.voice-call-controls>button.on{background:var(--k-selected);border-color:var(--k-brass)}
+.voice-call-controls>button[aria-pressed=true]:has(.lucide-mic-off){color:var(--k-danger);border-color:var(--k-danger)}
+.voice-call-volume{display:inline-flex;align-items:center;gap:6px;margin-left:auto}
+.voice-call-volume>button{width:40px;padding:0}
+.voice-call-volume>span{min-width:72px;text-align:center;font-variant-numeric:tabular-nums;color:var(--k-ink-2)}
+.voice-call-hangup{min-height:44px;padding:8px 22px;border:1px solid var(--k-danger);background:var(--k-danger);color:var(--k-sheet);font-weight:700;border-radius:999px}
+.voice-call-hangup:hover:not(:disabled){background:var(--k-danger-strong)}
+.voice-call-close{min-height:40px;padding:8px 18px;border:1px solid var(--k-line-strong);background:var(--k-raised);font-weight:700}
+
+.secretary-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:12px}
+.secretary-line{display:flex;flex-direction:column;gap:4px;max-width:86%;align-self:flex-start}
+.secretary-line.owner{align-self:flex-end;align-items:flex-end}
+.secretary-line small,.secretary-card small{color:var(--k-ink-3);font-size:var(--k-text-xs)}
+.secretary-line>div{padding:9px 13px;border-radius:16px;background:var(--k-sunken);border:1px solid var(--k-line);line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;user-select:text}
+.secretary-line.owner>div{background:var(--k-selected)}
+.secretary-card{display:flex;flex-direction:column;align-items:flex-start;gap:6px;padding:12px 14px;border:1px solid var(--k-line);border-left:3px solid var(--k-brass);border-radius:var(--k-radius-sm);background:var(--k-raised)}
+.secretary-card.report{border-left-color:var(--k-ok)}
+.secretary-card.status-not-sent,.secretary-card.status-uncertain,.secretary-card.status-not-created{border-left-color:var(--k-warn)}
+.secretary-create-settings{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;margin:0;align-self:stretch;font-size:var(--k-text-sm)}
+.secretary-create-settings dt{color:var(--k-ink-3)}
+.secretary-create-settings dd{margin:0;overflow-wrap:anywhere}
+.secretary-card-text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6;max-height:240px;overflow-y:auto;align-self:stretch;user-select:text}
+.secretary-card-error{color:var(--k-warn);font-size:var(--k-text-xs)}
+.secretary-open-room{min-height:34px;padding:5px 12px;border:1px solid var(--k-line-strong);background:var(--k-raised);font-size:var(--k-text-xs);font-weight:700}
+.secretary-end{color:var(--k-ink-3);font-size:var(--k-text-xs);text-align:center}
+
+@media(max-width:700px){
+ body:has(.voice-call-panel) .secretary-page .schedule-page-scroll{padding-bottom:calc(var(--voice-call-panel-height) + 16px)}
+ .voice-call-panel{left:0;right:0;top:auto;bottom:0;width:100%;max-height:70dvh;border-radius:22px 22px 0 0;padding:18px 16px max(18px,env(safe-area-inset-bottom))}
+ .voice-call-hangup{flex:1}
+ .voice-call-button{min-height:40px}
+ .secretary-line{max-width:92%}
+}
+@media(pointer:coarse){.voice-call-button,.secretary-open-room,.voice-call-controls>button,.voice-call-volume>button{min-height:44px}.voice-call-volume>button{width:44px}}
+/* With the call button the actions can outgrow a narrow desktop header; keep the title readable and let the
+   actions wrap to their own line instead of squeezing the title to nothing. */
+@media(min-width:701px){main>header .header-title{min-width:min(200px,100%)}}
+/* Emma's notes: a header button beside the call button, and a dialog listing the notes with edit and delete. */
+.secretary-page .schedule-page-header .secretary-notes-button{margin-left:auto}
+.secretary-page .schedule-page-header .secretary-notes-button+.voice-call-button{margin-left:0}
+.secretary-notes-button{flex:none;min-height:34px;padding:6px 12px;border:1px solid var(--k-line-strong);background:var(--k-raised);color:var(--k-ink);font-size:var(--k-text-sm);font-weight:700;border-radius:999px;white-space:nowrap}
+.secretary-notes-button:disabled{opacity:.55}
+.secretary-notes-help{margin:0 0 12px;color:var(--k-ink-2);font-size:var(--k-text-sm);line-height:1.6}
+.secretary-notes{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:10px}
+.secretary-note{display:flex;flex-direction:column;gap:6px;padding:12px 14px;border:1px solid var(--k-line);border-radius:var(--k-radius-sm);background:var(--k-raised);min-width:0}
+.secretary-note small{color:var(--k-ink-3);font-size:var(--k-text-xs)}
+.secretary-note-text{white-space:pre-wrap;overflow-wrap:anywhere;line-height:1.6;user-select:text}
+.secretary-note-actions{display:flex;flex-wrap:wrap;gap:8px;justify-content:flex-end}
+.secretary-note-actions>button{min-height:34px;padding:5px 14px;border:1px solid var(--k-line-strong);background:var(--k-sunken);color:var(--k-ink);font-size:var(--k-text-sm);font-weight:700}
+.secretary-note-actions>button.primary{background:var(--k-ink);border-color:var(--k-ink);color:var(--k-sheet)}
+.secretary-note-actions>button.danger{background:var(--k-warn-wash);border-color:var(--k-warn);color:var(--k-warn)}
+.secretary-note-actions>button:disabled{opacity:.55}
+.secretary-note-confirm{display:flex;flex-direction:column;gap:8px;padding:10px 12px;border:1px solid var(--k-warn);border-radius:var(--k-radius-sm);background:var(--k-warn-wash);font-size:var(--k-text-sm)}
+.secretary-note-edit{display:flex;flex-direction:column;gap:8px}
+.secretary-note-edit textarea{width:100%;min-width:0;box-sizing:border-box;resize:vertical;font:inherit;line-height:1.6;padding:8px 10px;border:1px solid var(--k-line-strong);border-radius:var(--k-radius-sm);background:var(--k-sheet);color:var(--k-ink)}
+.secretary-card.note{border-left-color:var(--k-ink-3)}
+.secretary-card-previous{color:var(--k-ink-3);font-size:var(--k-text-xs);white-space:pre-wrap;overflow-wrap:anywhere}
+@media(pointer:coarse){.secretary-notes-button,.secretary-note-actions>button{min-height:44px}}
+@media(max-width:700px){.secretary-note-actions>button{flex:1 1 auto}}

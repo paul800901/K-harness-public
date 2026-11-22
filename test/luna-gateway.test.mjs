@@ -1,0 +1,1099 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import {request as httpRequest} from 'node:http';
+import {createLunaGateway} from '../src/luna-gateway.mjs';
+test('Gemma gemini-named gateway accepts an explicitly selected GPT subscription worker', async () => {
+  const f = fixture();
+  const gateway = await createLunaGateway({bridge: f.bridge, geminiOnly: true, allowCodex: true});
+  try {
+    const {url, headers} = gateway.mcpConfig.mcpServers.k_gemini,
+      token = headers.Authorization.slice(7);
+    const result = await body(
+      await post(url, token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {
+          name: 'gemini_start',
+          arguments: {requestId: 'test-gemma-gpt', task: 'synthetic', model: 'gpt-6-luna', effort: 'high'}
+        }
+      })
+    );
+    assert.equal(result.result.isError, undefined);
+    assert.equal(result.result.structuredContent.provider, 'codex');
+  } finally {
+    await gateway.close();
+  }
+});
+
+function fixture() {
+  const records = new Map();
+  let closeCount = 0;
+  const listCalls = [];
+  let listRows, listError;
+  const bridge = {
+    workerPolicy: {model: 'auto', effort: 'auto'},
+    async start({requestId, task}) {
+      const old = records.get(requestId);
+      if (old) {
+        if (old.task !== task) throw Error('different task');
+        return old;
+      }
+      const record = {
+        requestId,
+        provider: 'codex',
+        model: 'gpt-6-luna',
+        status: 'running',
+        settled: false,
+        acceptance: 'not-reviewed',
+        task,
+        output: '',
+        outputFiles: []
+      };
+      records.set(requestId, record);
+      return record;
+    },
+    async wait({requestId}) {
+      const r = records.get(requestId);
+      if (r) {
+        r.status = 'completed';
+        r.settled = true;
+        r.output = 'done';
+      }
+      return r ?? null;
+    },
+    async inspect({requestId}) {
+      return records.get(requestId) ?? null;
+    },
+    async cancel({requestId}) {
+      const r = records.get(requestId);
+      if (r) {
+        r.status = 'cancelled';
+        r.settled = true;
+      }
+      return r ?? null;
+    },
+    async list(includeSettled) {
+      listCalls.push(includeSettled);
+      if (listError) throw listError;
+      return listRows ?? [...records.values()];
+    },
+    async close() {
+      closeCount++;
+    }
+  };
+  return {
+    bridge,
+    records,
+    listCalls,
+    setListRows(rows) {
+      listRows = rows;
+    },
+    setListError(error) {
+      listError = error;
+    },
+    closeCount: () => closeCount
+  };
+}
+async function post(url, token, message, headers = {}) {
+  return fetch(url, {
+    method: 'POST',
+    headers: {
+      authorization: `Bearer ${token}`,
+      'content-type': 'application/json',
+      accept: 'application/json, text/event-stream',
+      ...headers
+    },
+    body: JSON.stringify(message)
+  });
+}
+function spoofHost(url, token) {
+  const target = new URL(url);
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        hostname: '127.0.0.1',
+        port: Number(target.port),
+        path: target.pathname,
+        method: 'POST',
+        headers: {host: 'attacker.invalid', authorization: `Bearer ${token}`, 'content-type': 'application/json'}
+      },
+      res => {
+        res.resume();
+        res.on('end', () => resolve(res.statusCode));
+      }
+    );
+    req.on('error', reject);
+    req.end('{}');
+  });
+}
+async function body(response) {
+  const text = await response.text();
+  const data = text
+    .split(/\r?\n/u)
+    .filter(line => line.startsWith('data:'))
+    .map(line => line.slice(5).trim())
+    .join('\n');
+  return JSON.parse(data || text);
+}
+
+test('main-conversation MCP exposes distinct fresh and history-branch tools with fixed modes', async () => {
+  const f = fixture(),
+    seen = [],
+    gateway = await createLunaGateway({
+      bridge: f.bridge,
+      geminiOnly: true,
+      continueConversation: async (args, meta) => {
+        seen.push({args, meta});
+        return {accepted: true, created: false, started: false, mode: args.mode};
+      }
+    });
+  try {
+    const {url, headers} = gateway.mcpConfig.mcpServers.k_gemini,
+      token = headers.Authorization.slice(7);
+    await body(
+      await post(url, token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}}
+      })
+    );
+    const listed = (await body(await post(url, token, {jsonrpc: '2.0', id: 2, method: 'tools/list', params: {}})))
+      .result.tools;
+    assert.match(listed.find(t => t.name === 'conversation_create').description, /truly blank.*compactions/s);
+    assert.match(
+      listed.find(t => t.name === 'conversation_create').description,
+      /already accepted.*confirmed recoverable native terminal failure/
+    );
+    assert.doesNotMatch(listed.find(t => t.name === 'conversation_continue').description, /already accepted/);
+    assert.match(
+      listed.find(t => t.name === 'conversation_continue').description,
+      /ONLY when the human wants to preserve/
+    );
+    for (const [name, mode] of [
+      ['conversation_create', 'fresh'],
+      ['conversation_continue', 'fork']
+    ]) {
+      const value = await body(
+        await post(url, token, {
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'tools/call',
+          params: {name, arguments: {nextInstruction: 'explicit handoff'}, _meta: {own: 'main'}}
+        })
+      );
+      assert.deepEqual(seen.at(-1), {args: {nextInstruction: 'explicit handoff', mode}, meta: {own: 'main'}});
+      assert.equal(JSON.parse(value.result.content[0].text).mode, mode);
+      await body(
+        await post(url, token, {
+          jsonrpc: '2.0',
+          id: 4,
+          method: 'tools/call',
+          params: {name, arguments: {nextInstruction: 'handoff', mode: 'other'}}
+        })
+      );
+    }
+    assert.equal(seen.length, 2);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('only fresh conversation_create accepts optional target model and effort', async () => {
+  const f = fixture(),
+    seen = [],
+    gateway = await createLunaGateway({
+      bridge: f.bridge,
+      geminiOnly: true,
+      continueConversation: async args => {
+        seen.push(args);
+        return {accepted: true};
+      }
+    });
+  try {
+    const {url, headers} = gateway.mcpConfig.mcpServers.k_gemini,
+      token = headers.Authorization.slice(7);
+    await body(
+      await post(url, token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}}
+      })
+    );
+    const listed = (await body(await post(url, token, {jsonrpc: '2.0', id: 2, method: 'tools/list', params: {}})))
+      .result.tools;
+    const fresh = listed.find(t => t.name === 'conversation_create'),
+      fork = listed.find(t => t.name === 'conversation_continue');
+    assert.ok(fresh.inputSchema.properties.model);
+    assert.ok(fresh.inputSchema.properties.effort);
+    assert.equal(fork.inputSchema.properties.model, undefined);
+    const args = {nextInstruction: 'remaining', model: 'native-target', effort: 'high'};
+    const call = async (name, arguments_) =>
+      body(
+        await post(url, token, {jsonrpc: '2.0', id: 3, method: 'tools/call', params: {name, arguments: arguments_}})
+      );
+    assert.equal((await call('conversation_create', args)).result.isError, undefined);
+    assert.deepEqual(seen.at(-1), {...args, mode: 'fresh'});
+    await call('conversation_continue', args);
+    assert.equal(seen.length, 1);
+    await call('conversation_create', {...args, effort: null});
+    assert.equal(seen.at(-1).effort, null);
+    await call('conversation_create', {...args, model: ''});
+    assert.equal(seen.length, 2);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('context gateway retains item paging and exposes explicit turn cursors and exact original ranges', async () => {
+  const f = fixture(),
+    seen = [];
+  const gateway = await createLunaGateway({
+    bridge: f.bridge,
+    readContext: async args => {
+      seen.push(args);
+      return {original: {text: '中文🙂中段', charCount: 6, nextOffset: null}};
+    }
+  });
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_luna,
+      url = config.url,
+      token = config.headers.Authorization.slice(7);
+    await body(
+      await post(url, token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}}
+      })
+    );
+    for (const args of [
+      {cursor: 'native-item-cursor'},
+      {source: 'turns', cursor: 'native-turn-cursor'},
+      {original: {messageId: 'm', turnId: 't', offset: 2000}}
+    ]) {
+      const value = await body(
+        await post(url, token, {
+          jsonrpc: '2.0',
+          id: 2,
+          method: 'tools/call',
+          params: {name: 'conversation_context', arguments: args}
+        })
+      );
+      assert.deepEqual(seen.at(-1), args);
+      assert.equal(JSON.parse(value.result.content[0].text).original.text, '中文🙂中段');
+    }
+    const count = seen.length;
+    for (const args of [
+      {cursor: {type: 'item', itemId: 'm'}},
+      {source: 'wrong'},
+      {cursor: 'c', original: {messageId: 'm', turnId: 't', offset: 0}},
+      {hook: true, original: {messageId: 'm', turnId: 't', offset: 0}},
+      {original: {messageId: 'm', turnId: 't', offset: -1}}
+    ])
+      await body(
+        await post(url, token, {
+          jsonrpc: '2.0',
+          id: 3,
+          method: 'tools/call',
+          params: {name: 'conversation_context', arguments: args}
+        })
+      );
+    assert.equal(seen.length, count);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('gateway is loopback-only, bearer-authenticated, and exposes fixed MCP Luna tools', async () => {
+  const f = fixture();
+  const gateway = await createLunaGateway({bridge: f.bridge});
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_luna;
+    assert.equal(config.type, 'http');
+    assert.match(config.url, /^http:\/\/127\.0\.0\.1:\d+\/mcp$/);
+    assert.match(config.headers.Authorization, /^Bearer [A-Za-z0-9_-]{40,}$/);
+    const token = config.headers.Authorization.slice(7);
+    assert.equal(
+      (await post(config.url, 'wrong', {jsonrpc: '2.0', id: 1, method: 'initialize', params: {}})).status,
+      401
+    );
+    const init = await body(
+      await post(config.url, token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}}
+      })
+    );
+    assert.equal(init.result.serverInfo.name, 'k-luna-gateway');
+    const listed = await body(await post(config.url, token, {jsonrpc: '2.0', id: 2, method: 'tools/list', params: {}}));
+    assert.deepEqual(listed.result.tools.map(tool => tool.name).sort(), [
+      'luna_cancel',
+      'luna_inspect',
+      'luna_list',
+      'luna_start',
+      'luna_wait'
+    ]);
+    assert.match(listed.result.tools.find(tool => tool.name === 'luna_start').description, /AI 自動選擇目前啟用/);
+    const started = await body(
+      await post(config.url, token, {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: {name: 'luna_start', arguments: {requestId: 'stable', task: 'bounded'}}
+      })
+    );
+    assert.equal(started.result.structuredContent.model, 'gpt-6-luna');
+    const duplicate = await body(
+      await post(config.url, token, {
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tools/call',
+        params: {name: 'luna_start', arguments: {requestId: 'stable', task: 'bounded'}}
+      })
+    );
+    assert.equal(duplicate.result.structuredContent.requestId, 'stable');
+    assert.equal(f.records.size, 1);
+    const changed = await body(
+      await post(config.url, token, {
+        jsonrpc: '2.0',
+        id: 5,
+        method: 'tools/call',
+        params: {name: 'luna_start', arguments: {requestId: 'stable', task: 'different'}}
+      })
+    );
+    assert.equal(changed.result.isError, true);
+    assert.match(changed.result.content[0].text, /different task/);
+    assert.equal(
+      (
+        await post(
+          config.url,
+          token,
+          {jsonrpc: '2.0', id: 6, method: 'tools/list', params: {}},
+          {origin: 'https://evil.example'}
+        )
+      ).status,
+      403
+    );
+    assert.equal(await spoofHost(config.url, token), 403);
+    assert.equal(
+      (await fetch(config.url.replace('/mcp', '/else'), {method: 'POST', headers: {authorization: `Bearer ${token}`}}))
+        .status,
+      404
+    );
+  } finally {
+    await gateway.close();
+  }
+  assert.equal(f.closeCount(), 1);
+});
+
+test('gateway wait, inspect and cancel route only stable request ids to the bridge', async () => {
+  const f = fixture();
+  const gateway = await createLunaGateway({bridge: f.bridge});
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_luna,
+      token = config.headers.Authorization.slice(7);
+    await post(config.url, token, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}}
+    });
+    const call = async (id, name, args) =>
+      body(await post(config.url, token, {jsonrpc: '2.0', id, method: 'tools/call', params: {name, arguments: args}}));
+    await call(2, 'luna_start', {requestId: 'r1', task: 't'});
+    assert.equal(
+      (await call(3, 'luna_wait', {requestId: 'r1', timeoutMs: 0})).result.structuredContent.status,
+      'completed'
+    );
+    assert.equal((await call(4, 'luna_inspect', {requestId: 'r1'})).result.structuredContent.output, 'done');
+    // An unknown id says so in the final MCP reply instead of looking like an unfinished job.
+    assert.deepEqual((await call(6, 'luna_inspect', {requestId: 'nope'})).result.structuredContent, {
+      requestId: 'nope',
+      found: false,
+      message: 'No worker job with this requestId in this conversation; use luna_list.'
+    });
+    assert.equal((await call(5, 'luna_cancel', {requestId: 'r1'})).result.structuredContent.status, 'cancelled');
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('Gemini-named and nested Luna gateways return a live clarification and accept its exact answer', async () => {
+  for (const options of [{geminiOnly: true}, {nestedWorker: true}]) {
+    const prefix = options.geminiOnly ? 'gemini' : 'luna';
+    const f = fixture(),
+      answers = [],
+      pendingQuestion = {id: '123e4567-e89b-42d3-a456-426614174000', text: '請問用哪份樣本？'};
+    const record = await f.bridge.start({requestId: 'job', task: 'Run the sample'});
+    record.pendingQuestion = pendingQuestion;
+    f.bridge.wait = f.bridge.inspect;
+    f.bridge.answer = async args => {
+      answers.push(args);
+      const live = f.records.get(args.requestId);
+      if (live?.pendingQuestion?.id !== args.questionId) throw Error('Question is no longer pending.');
+      delete live.pendingQuestion;
+      return live;
+    };
+    const gateway = await createLunaGateway({bridge: f.bridge, ...options});
+    try {
+      const {url, headers} = gateway.mcpConfig.mcpServers[`k_${prefix}`],
+        token = headers.Authorization.slice(7);
+      const rpc = async (id, method, params) => body(await post(url, token, {jsonrpc: '2.0', id, method, params}));
+      const call = (id, tool, args) => rpc(id, 'tools/call', {name: `${prefix}_${tool}`, arguments: args});
+      await rpc(1, 'initialize', {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}});
+      const tools = (await rpc(2, 'tools/list', {})).result.tools;
+      assert.ok(tools.some(tool => tool.name === `${prefix}_answer`));
+      assert.match(tools.find(tool => tool.name === `${prefix}_wait`).description, new RegExp(`${prefix}_answer`));
+      const waited = (await call(3, 'wait', {requestId: 'job', timeoutMs: null})).result.structuredContent;
+      assert.deepEqual(waited.pendingQuestion, pendingQuestion);
+      assert.equal(waited.settled, false);
+      assert.deepEqual(
+        (await call(4, 'inspect', {requestId: 'job'})).result.structuredContent.pendingQuestion,
+        pendingQuestion
+      );
+      const args = {requestId: 'job', questionId: pendingQuestion.id, answer: '  樣本 A  '};
+      for (const [id, invalid] of [
+        [5, {...args, answer: '   '}],
+        [6, {...args, answer: 'x'.repeat(8001)}],
+        [7, {...args, questionId: 'invalid'}],
+        [8, {...args, parentId: 'other-room'}]
+      ]) {
+        const response = await call(id, 'answer', invalid);
+        assert.ok(response.error || response.result?.isError);
+      }
+      assert.deepEqual(answers, []);
+      const stale = await call(9, 'answer', {...args, requestId: 'other-job'});
+      assert.equal(stale.result.isError, true);
+      const answered = (await call(10, 'answer', args)).result.structuredContent;
+      assert.equal(answered.requestId, 'job');
+      assert.equal(answered.settled, false);
+      assert.equal(answered.pendingQuestion, undefined);
+      assert.deepEqual(answers.at(-1), {...args, answer: '樣本 A'});
+      assert.equal((await call(11, 'answer', args)).result.isError, true);
+    } finally {
+      await gateway.close();
+    }
+  }
+});
+
+test('worker list tools expose only unfinished summaries without acknowledging or controlling work', async () => {
+  const rows = [
+    {
+      requestId: 'gemini-old',
+      provider: 'gemini',
+      model: 'gemini-3.8-flash',
+      status: 'unresolved',
+      settled: false,
+      executionUnowned: true,
+      startedAt: 1,
+      lastActivityAt: 2,
+      lastReadAt: 3,
+      error: 'known error',
+      task: 'private task',
+      output: 'private output',
+      pid: 321,
+      accountId: 'private account'
+    },
+    {
+      requestId: 'codex-live',
+      provider: 'codex',
+      model: 'gpt-6-luna',
+      status: 'running',
+      settled: false,
+      task: 'private task',
+      output: 'private output',
+      pid: 322,
+      accountId: 'private account'
+    },
+    {requestId: 'gemini-settled', provider: 'gemini', status: 'completed', settled: true, task: 'private task'},
+    {requestId: 'codex-old', provider: 'codex', status: 'running', settled: false, executionUnowned: true},
+    {requestId: 'codex-settled', provider: 'codex', status: 'completed', settled: true, executionUnowned: true}
+  ];
+  for (const {geminiOnly, prefix, expectedIds} of [
+    {geminiOnly: false, prefix: 'luna', expectedIds: ['gemini-old', 'codex-live', 'codex-old']},
+    {geminiOnly: true, prefix: 'gemini', expectedIds: ['gemini-old', 'codex-old']}
+  ]) {
+    const f = fixture();
+    f.setListRows(rows);
+    let acknowledgements = 0,
+      controlCalls = 0;
+    f.bridge.resultReady = () => {
+      acknowledgements++;
+    };
+    for (const name of ['start', 'inspect', 'cancel'])
+      f.bridge[name] = async () => {
+        controlCalls++;
+        throw Error(`unexpected ${name}`);
+      };
+    const gateway = await createLunaGateway({bridge: f.bridge, geminiOnly});
+    try {
+      const config = gateway.mcpConfig.mcpServers[geminiOnly ? 'k_gemini' : 'k_luna'],
+        token = config.headers.Authorization.slice(7);
+      const rpc = async (id, method, params) =>
+        body(await post(config.url, token, {jsonrpc: '2.0', id, method, params}));
+      await rpc(1, 'initialize', {
+        protocolVersion: '2025-11-25',
+        capabilities: {},
+        clientInfo: {name: 'list-test', version: '1'}
+      });
+      const listed = await rpc(2, 'tools/list', {}),
+        tool = listed.result.tools.find(entry => entry.name === `${prefix}_list`);
+      assert(tool);
+      assert.deepEqual(Object.keys(tool.inputSchema.properties), []);
+      assert.equal(tool.inputSchema.additionalProperties, false);
+      const result = await rpc(3, 'tools/call', {name: `${prefix}_list`, arguments: {}});
+      assert.deepEqual(
+        result.result.structuredContent.workers.map(row => row.requestId),
+        expectedIds
+      );
+      assert.equal(result.result.structuredContent.workers[0].executionUnowned, true);
+      assert.equal(
+        result.result.structuredContent.workers.some(row => row.settled === true),
+        false
+      );
+      const serialized = JSON.stringify(result.result.structuredContent);
+      for (const secretField of ['private task', 'private output', 'private account', '"pid"'])
+        assert.equal(serialized.includes(secretField), false, `list excludes ${secretField}`);
+      assert.deepEqual(f.listCalls, [false]);
+      assert.equal(acknowledgements, 0);
+      assert.equal(controlCalls, 0);
+      const parentOverride = await rpc(4, 'tools/call', {
+        name: `${prefix}_list`,
+        arguments: {parentId: 'another-conversation'}
+      });
+      assert(parentOverride.error || parentOverride.result?.isError);
+      assert.deepEqual(f.listCalls, [false]);
+    } finally {
+      await gateway.close();
+    }
+  }
+});
+
+test('worker list errors remain unknown instead of becoming an empty successful list', async () => {
+  const f = fixture();
+  f.setListError(new Error('native list read failed'));
+  const gateway = await createLunaGateway({bridge: f.bridge, geminiOnly: true});
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_gemini,
+      token = config.headers.Authorization.slice(7);
+    const result = await body(
+      await post(config.url, token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'tools/call',
+        params: {name: 'gemini_list', arguments: {}}
+      })
+    );
+    assert.equal(result.result.isError, true);
+    assert.match(result.result.content[0].text, /native list read failed/);
+    assert.match(result.result.content[0].text, /remain unknown/);
+    assert.equal(result.result.structuredContent, undefined);
+    assert.deepEqual(f.listCalls, [false]);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('gateway acknowledges only successfully prepared results, not output preparation errors', async () => {
+  const f = fixture(),
+    acks = [];
+  f.bridge.resultReady = (args, value) => acks.push([args.requestId, value.settled]);
+  const gateway = await createLunaGateway({bridge: f.bridge});
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_luna,
+      token = config.headers.Authorization.slice(7);
+    const call = async (id, name, args) =>
+      body(await post(config.url, token, {jsonrpc: '2.0', id, method: 'tools/call', params: {name, arguments: args}}));
+    await call(1, 'luna_start', {requestId: 'r', task: 'bounded'});
+    assert.deepEqual(acks, [['r', false]]);
+    Object.assign(f.records.get('r'), {
+      settled: true,
+      status: 'completed',
+      output: 'x'.repeat(5000),
+      workspace: 'invalid',
+      parentId: 'parent'
+    });
+    const bad = await call(2, 'luna_inspect', {requestId: 'r'});
+    assert.equal(bad.result.isError, true);
+    assert.equal(acks.length, 1);
+    f.records.get('r').output = 'done';
+    await call(3, 'luna_inspect', {requestId: 'r'});
+    assert.deepEqual(acks, [
+      ['r', false],
+      ['r', true]
+    ]);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('MCP start forwards both worker choices and an explicit effort to the bridge', async () => {
+  const f = fixture();
+  const calls = [];
+  f.bridge.start = async args => {
+    calls.push(args);
+    return {requestId: args.requestId, model: args.model, effort: args.effort, status: 'running'};
+  };
+  const gateway = await createLunaGateway({bridge: f.bridge});
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_luna,
+      token = config.headers.Authorization.slice(7);
+    await post(config.url, token, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'workers', version: '1'}}
+    });
+    const listed = await body(await post(config.url, token, {jsonrpc: '2.0', id: 2, method: 'tools/list'}));
+    const start = listed.result.tools.find(t => t.name === 'luna_start');
+    assert.equal(start.inputSchema.properties.model.type, 'string');
+    assert.equal(start.inputSchema.properties.model.enum, undefined);
+    // 2026-10-27: role preferences live in the private K common memory, not in tool text.
+    assert.match(start.description, /依 K 共同記憶的本人分工偏好與當輪明確指定選擇模型/);
+    assert.match(start.description, /無審查管道則標示待審，不冒稱完成/);
+    assert.match(start.description, /不能跑指令/);
+    assert.doesNotMatch(start.description, /Flash 是使用者優先|優先 Flash|Opus 統籌|Luna 僅用於|Sol 寫碼後/);
+    let id = 3;
+    for (const model of [
+      'gpt-6.1-sol',
+      'gpt-6-luna',
+      'gemini-3.8-flash',
+      'claude-opus-5-5',
+      'claude-sonnet-5-5',
+      'claude-haiku-5-5',
+      'gpt-future-native',
+      'gemini-future-native'
+    ]) {
+      const args = {requestId: model, task: 'fake task', model, effort: 'low'};
+      const result = await body(
+        await post(config.url, token, {
+          jsonrpc: '2.0',
+          id: id++,
+          method: 'tools/call',
+          params: {name: 'luna_start', arguments: args}
+        })
+      );
+      assert.notEqual(result.result.isError, true);
+      assert.deepEqual(calls.at(-1), args);
+      assert.equal(result.result.structuredContent.model, model);
+      assert.equal(result.result.structuredContent.effort, 'low');
+    }
+    for (const effort of [123, {}, []]) {
+      const bad = await body(
+        await post(config.url, token, {
+          jsonrpc: '2.0',
+          id: id++,
+          method: 'tools/call',
+          params: {name: 'luna_start', arguments: {requestId: 'bad', task: 'fake', model: 'gemini-3.8-flash', effort}}
+        })
+      );
+      assert.equal(bad.result.isError, true);
+      assert.equal(calls.length, 8);
+    }
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('MCP tool description reflects a concrete user default without implying AI-auto', async () => {
+  const f = fixture();
+  f.bridge.workerPolicy = {model: 'gpt-6.1-sol', effort: 'ultra'};
+  const gateway = await createLunaGateway({bridge: f.bridge});
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_luna,
+      token = config.headers.Authorization.slice(7);
+    await post(config.url, token, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'policy', version: '1'}}
+    });
+    const listed = await body(await post(config.url, token, {jsonrpc: '2.0', id: 2, method: 'tools/list'}));
+    const description = listed.result.tools.find(tool => tool.name === 'luna_start').description;
+    assert.match(description, /目前預設為 gpt-6\.1-sol \/ ultra/);
+    assert.doesNotMatch(description, /AI 自動選擇目前啟用/);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('Codex Flash gateway exposes only Gemini tools and forwards account handoff without GPT fallback', async () => {
+  const f = fixture(),
+    calls = [];
+  f.bridge.accounts = async () => ({
+    activeAccountId: 'a'.repeat(32),
+    accounts: [{id: 'a'.repeat(32), email: 'fake@example.test', quota: {status: 'stale', windows: []}}]
+  });
+  f.bridge.start = async args => {
+    calls.push(args);
+    return {
+      requestId: args.requestId,
+      provider: 'gemini',
+      model: args.model,
+      accountId: args.accountId,
+      handoffFrom: args.handoffFrom,
+      status: 'running',
+      settled: false
+    };
+  };
+  const gateway = await createLunaGateway({bridge: f.bridge, geminiOnly: true});
+  try {
+    assert.deepEqual(Object.keys(gateway.mcpConfig.mcpServers), ['k_gemini']);
+    const config = gateway.mcpConfig.mcpServers.k_gemini,
+      token = config.headers.Authorization.slice(7);
+    const call = async (id, name, args) =>
+      body(await post(config.url, token, {jsonrpc: '2.0', id, method: 'tools/call', params: {name, arguments: args}}));
+    const listed = await body(await post(config.url, token, {jsonrpc: '2.0', id: 1, method: 'tools/list'}));
+    assert.deepEqual(listed.result.tools.map(t => t.name).sort(), [
+      'gemini_accounts',
+      'gemini_cancel',
+      'gemini_inspect',
+      'gemini_list',
+      'gemini_start',
+      'gemini_wait'
+    ]);
+    const accountTool = listed.result.tools.find(t => t.name === 'gemini_accounts'),
+      accountGuidance = accountTool.description;
+    assert.equal(accountTool.annotations.readOnlyHint, true);
+    assert.equal(accountTool.annotations.idempotentHint, true);
+    assert.match(accountGuidance, /current official Antigravity login/);
+    assert.match(accountGuidance, /omit accountId/i);
+    assert.match(accountGuidance, /unknown/i);
+    const info = await call(2, 'gemini_accounts', {});
+    assert.match(info.result.content[0].text, /fake@example.test/);
+    const args = {
+      requestId: 'remaining',
+      task: 'only remaining',
+      model: 'gemini-3.8-flash',
+      effort: 'low',
+      accountId: 'b'.repeat(32),
+      handoffFrom: 'previous'
+    };
+    const result = await call(3, 'gemini_start', args);
+    assert.equal(result.result.structuredContent.accountId, args.accountId);
+    assert.deepEqual(calls, [{...args, model: 'gemini-3.8-flash'}]);
+    for (const override of [{model: 'gpt-6-luna'}, {effort: 123}, {model: 3}]) {
+      const bad = await call(4, 'gemini_start', {...args, ...override});
+      assert.equal(bad.result.isError, true);
+    }
+    const wrong = await call(5, 'luna_start', args);
+    assert.ok(wrong.error || wrong.result?.isError);
+    assert.equal(calls.length, 1);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('goal edit MCP receives native metadata, exposes objective only and never asks for confirmation', async () => {
+  const f = fixture(),
+    calls = [];
+  const gateway = await createLunaGateway({
+    bridge: f.bridge,
+    geminiOnly: true,
+    editGoal: async (args, meta) => {
+      calls.push({args, meta});
+      return {goal: {objective: args.objective, status: 'paused'}};
+    }
+  });
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_gemini,
+      token = config.headers.Authorization.slice(7);
+    const rpc = async (id, method, params) => body(await post(config.url, token, {jsonrpc: '2.0', id, method, params}));
+    await rpc(1, 'initialize', {
+      protocolVersion: '2025-11-25',
+      capabilities: {},
+      clientInfo: {name: 'test', version: '1'}
+    });
+    const listed = await rpc(2, 'tools/list', {}),
+      tool = listed.result.tools.find(t => t.name === 'goal_edit');
+    assert(tool);
+    assert.deepEqual(Object.keys(tool.inputSchema.properties), ['objective']);
+    assert.equal(tool.inputSchema.additionalProperties, false);
+    const meta = {'x-codex-turn-metadata': {thread_id: 'parent', turn_id: 'turn'}};
+    const result = await rpc(3, 'tools/call', {name: 'goal_edit', arguments: {objective: ' edited '}, _meta: meta});
+    assert.equal(result.result.isError, undefined);
+    assert.deepEqual(calls, [{args: {objective: 'edited'}, meta}]);
+    for (const args of [
+      {objective: 'x', status: 'active'},
+      {objective: 'x', threadId: 'other'},
+      {objective: 'x', tokenBudget: 999},
+      {objective: ' '},
+      {objective: 'x'.repeat(4001)}
+    ]) {
+      const bad = await rpc(4, 'tools/call', {name: 'goal_edit', arguments: args});
+      assert(bad.error || bad.result?.isError);
+    }
+    assert.equal(calls.length, 1);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('goal resume MCP has no goal, thread, budget or confirmation override and forwards native metadata', async () => {
+  const f = fixture(),
+    calls = [];
+  const gateway = await createLunaGateway({
+    bridge: f.bridge,
+    geminiOnly: true,
+    resumeGoal: async (args, meta) => {
+      calls.push({args, meta});
+      return {goal: {objective: 'same', status: 'active'}};
+    }
+  });
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_gemini,
+      token = config.headers.Authorization.slice(7);
+    const rpc = async (id, method, params) => body(await post(config.url, token, {jsonrpc: '2.0', id, method, params}));
+    const listed = await rpc(1, 'tools/list', {}),
+      tool = listed.result.tools.find(t => t.name === 'goal_resume');
+    assert(tool);
+    assert.deepEqual(Object.keys(tool.inputSchema.properties), []);
+    assert.equal(tool.inputSchema.additionalProperties, false);
+    assert.match(tool.description, /paused or blocked/);
+    assert.match(tool.description, /ONLY after the user explicitly asks/);
+    assert.match(tool.description, /Editing goal text alone is NOT/);
+    const meta = {'x-codex-turn-metadata': {thread_id: 'parent', turn_id: 'turn'}};
+    const result = await rpc(2, 'tools/call', {name: 'goal_resume', arguments: {}, _meta: meta});
+    assert.equal(result.result.isError, undefined);
+    assert.deepEqual(calls, [{args: {}, meta}]);
+    for (const args of [
+      {objective: 'new'},
+      {threadId: 'other'},
+      {tokenBudget: 999},
+      {confirmed: true},
+      {status: 'active'}
+    ]) {
+      const bad = await rpc(3, 'tools/call', {name: 'goal_resume', arguments: args});
+      assert(bad.error || bad.result?.isError);
+    }
+    assert.equal(calls.length, 1);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('the process-only gateway accepts an api: worker model and lists unfinished api workers', async () => {
+  const f = fixture(),
+    calls = [],
+    model = `api:${'a'.repeat(32)}/deepseek-v4-pro`;
+  f.bridge.start = async args => {
+    calls.push(args);
+    return {requestId: args.requestId, provider: 'api', model: args.model, status: 'running', settled: false};
+  };
+  f.bridge.list = async () => [
+    {requestId: 'consult', provider: 'api', model, status: 'running', settled: false},
+    {requestId: 'native', provider: 'codex', status: 'running', settled: false}
+  ];
+  const gateway = await createLunaGateway({bridge: f.bridge, geminiOnly: true});
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_gemini,
+      token = config.headers.Authorization.slice(7);
+    const call = async (id, name, args) =>
+      body(await post(config.url, token, {jsonrpc: '2.0', id, method: 'tools/call', params: {name, arguments: args}}));
+    const args = {requestId: 'consult', task: '請諮詢', model, effort: 'high'};
+    const started = await call(1, 'gemini_start', args);
+    assert.notEqual(started.result.isError, true);
+    assert.deepEqual(calls, [args]);
+    const listed = await call(2, 'gemini_list', {});
+    assert.deepEqual(
+      listed.result.structuredContent.workers.map(row => row.requestId),
+      ['consult']
+    );
+    const gpt = await call(3, 'gemini_start', {...args, requestId: 'gpt', model: 'gpt-6.1-sol'});
+    assert.equal(gpt.result.isError, true);
+    assert.equal(calls.length, 1);
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('Codex gateway accepts core-qualified agy Claude and GPT models without stripping their route', async () => {
+  const f = fixture(),
+    calls = [];
+  f.bridge.start = async args => {
+    calls.push(args);
+    return {requestId: args.requestId, provider: 'gemini', status: 'running', settled: false};
+  };
+  const gateway = await createLunaGateway({bridge: f.bridge, geminiOnly: true});
+  try {
+    const config = gateway.mcpConfig.mcpServers.k_gemini,
+      token = config.headers.Authorization.slice(7);
+    for (const [model, effort] of [
+      ['antigravity:claude-sonnet-4-6', null],
+      ['antigravity:gpt-oss-120b', 'medium']
+    ]) {
+      const args = {requestId: `qualified-${calls.length}`, task: 'bounded fake task', model, effort};
+      const result = await body(
+        await post(config.url, token, {
+          jsonrpc: '2.0',
+          id: calls.length + 1,
+          method: 'tools/call',
+          params: {name: 'gemini_start', arguments: args}
+        })
+      );
+      assert.notEqual(result.result.isError, true);
+      assert.deepEqual(calls.at(-1), args);
+    }
+  } finally {
+    await gateway.close();
+  }
+});
+
+test('a nested-worker gateway tells the worker it receives no completion events and must wait', async () => {
+  for (const nestedWorker of [false, true]) {
+    const {bridge} = fixture();
+    bridge.accounts = async () => ({});
+    const gateway = await createLunaGateway({bridge, nestedWorker});
+    try {
+      const config = gateway.mcpConfig.mcpServers.k_luna,
+        token = config.headers.Authorization.slice(7);
+      await post(config.url, token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}}
+      });
+      const listed = await body(
+        await post(config.url, token, {jsonrpc: '2.0', id: 2, method: 'tools/list', params: {}})
+      );
+      const start = listed.result.tools.find(tool => tool.name === 'luna_start').description;
+      const accounts = listed.result.tools.find(tool => tool.name === 'gemini_accounts').description;
+      assert.match(accounts, /current official Antigravity login/);
+      if (nestedWorker) {
+        assert.match(start, /K delivers NO completion event to you/);
+        assert.match(start, /call luna_wait with .*timeoutMs=null/);
+        assert.doesNotMatch(start, /automatically delivers completion/);
+      } else {
+        assert.match(start, /K automatically delivers completion to this conversation/);
+      }
+    } finally {
+      await gateway.close();
+    }
+  }
+});
+
+test('continueFreshOnly exposes only conversation_create with schedule authorization guidance and no Codex failed-recovery wording', async () => {
+  const f = fixture(),
+    seen = [],
+    claudeGateway = await createLunaGateway({
+      bridge: f.bridge,
+      continueFreshOnly: true,
+      continueConversation: async (args, meta) => {
+        seen.push({args, meta});
+        return {accepted: true, mode: args.mode};
+      }
+    }),
+    codexGateway = await createLunaGateway({
+      bridge: f.bridge,
+      geminiOnly: true,
+      continueConversation: async () => ({accepted: true})
+    });
+  try {
+    const claudeCfg = claudeGateway.mcpConfig.mcpServers.k_luna,
+      claudeToken = claudeCfg.headers.Authorization.slice(7);
+    await post(claudeCfg.url, claudeToken, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}}
+    });
+    const claudeTools = (
+      await body(await post(claudeCfg.url, claudeToken, {jsonrpc: '2.0', id: 2, method: 'tools/list', params: {}}))
+    ).result.tools;
+    const createTool = claudeTools.find(t => t.name === 'conversation_create');
+    assert.ok(createTool);
+    assert.equal(claudeTools.find(t => t.name === 'conversation_continue'), undefined);
+    assert.match(
+      createTool.description,
+      /ONLY when the human explicitly asks in the current turn.*pre-set K schedule.*merely having a schedule set does not authorize moving/
+    );
+    assert.doesNotMatch(createTool.description, /already accepted|confirmed recoverable native terminal failure/);
+    assert.doesNotMatch(createTool.description, /conversation_continue/);
+
+    const okCall = await body(
+      await post(claudeCfg.url, claudeToken, {
+        jsonrpc: '2.0',
+        id: 3,
+        method: 'tools/call',
+        params: {
+          name: 'conversation_create',
+          arguments: {nextInstruction: 'claude fresh', model: 'claude-sonnet-4-6', effort: null},
+          _meta: {k: 1}
+        }
+      })
+    );
+    assert.equal(okCall.result.isError, undefined);
+    assert.deepEqual(seen, [
+      {args: {nextInstruction: 'claude fresh', model: 'claude-sonnet-4-6', effort: null, mode: 'fresh'}, meta: {k: 1}}
+    ]);
+
+    const missingContinue = await body(
+      await post(claudeCfg.url, claudeToken, {
+        jsonrpc: '2.0',
+        id: 4,
+        method: 'tools/call',
+        params: {name: 'conversation_continue', arguments: {nextInstruction: 'nope'}}
+      })
+    );
+    assert.ok(missingContinue.error || missingContinue.result?.isError);
+    assert.equal(seen.length, 1);
+
+    const codexCfg = codexGateway.mcpConfig.mcpServers.k_gemini,
+      codexToken = codexCfg.headers.Authorization.slice(7);
+    await post(codexCfg.url, codexToken, {
+      jsonrpc: '2.0',
+      id: 1,
+      method: 'initialize',
+      params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}}
+    });
+    const codexTools = (
+      await body(await post(codexCfg.url, codexToken, {jsonrpc: '2.0', id: 2, method: 'tools/list', params: {}}))
+    ).result.tools;
+    assert.ok(codexTools.find(t => t.name === 'conversation_create'));
+    assert.ok(codexTools.find(t => t.name === 'conversation_continue'));
+    for (const toolName of ['conversation_create', 'conversation_continue']) {
+      assert.match(
+        codexTools.find(t => t.name === toolName).description,
+        /ONLY when the human explicitly asks in the current turn.*pre-set K schedule.*merely having a schedule set does not authorize moving/
+      );
+    }
+  } finally {
+    await claudeGateway.close();
+    await codexGateway.close();
+  }
+});
+
+test('worker and nested-worker gateways never expose conversation continuation tools', async () => {
+  for (const options of [
+    {bridge: fixture().bridge},
+    {bridge: fixture().bridge, nestedWorker: true},
+    {
+      bridge: fixture().bridge,
+      nestedWorker: true,
+      continueFreshOnly: true,
+      continueConversation: async () => ({accepted: true})
+    }
+  ]) {
+    const gateway = await createLunaGateway(options);
+    try {
+      const cfg = gateway.mcpConfig.mcpServers.k_luna,
+        token = cfg.headers.Authorization.slice(7);
+      await post(cfg.url, token, {
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'initialize',
+        params: {protocolVersion: '2025-11-25', capabilities: {}, clientInfo: {name: 'test', version: '1'}}
+      });
+      const tools = (await body(await post(cfg.url, token, {jsonrpc: '2.0', id: 2, method: 'tools/list', params: {}})))
+        .result.tools;
+      assert.equal(tools.find(t => t.name === 'conversation_create'), undefined);
+      assert.equal(tools.find(t => t.name === 'conversation_continue'), undefined);
+    } finally {
+      await gateway.close();
+    }
+  }
+});
