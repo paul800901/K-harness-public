@@ -8,7 +8,7 @@ const {createConversationController} = await import(
   process.env.K_PROBE_CONTROLLER_MODULE ?? '../src/conversation-controller.mjs'
 );
 import {saveMainSession} from '../src/main-sessions.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 
 const out = probeEvidenceDir('independent-load-handoff-20261012/ui');
 await mkdir(out, {recursive: true});
@@ -138,7 +138,7 @@ for (const viewport of [
     gates.set('D', Promise.withResolvers());
     gates.set('E', Promise.withResolvers());
     const absent = () => ({close: async () => {}});
-    app = await startDesktop({
+    app = await startConfiguredDesktop({
       root,
       executable: 'fixture-only',
       port: 0,

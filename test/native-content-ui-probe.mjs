@@ -3,7 +3,7 @@ import {mkdir, mkdtemp, writeFile, readFile} from 'node:fs/promises';
 import path from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {launchProbeBrowser, probeEvidenceDir} from './ui-probe.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 import {resolveNativeMessageFile} from '../src/native-message-file.mjs';
 import {scratchBase} from './scratch.mjs';
 const out = probeEvidenceDir('native-content-ui');
@@ -53,7 +53,7 @@ try {
       capabilities: {}
     };
     const requests = [];
-    const app = await startDesktop({
+    const app = await startConfiguredDesktop({
       root: workspace,
       port: 0,
       controllerFactory: () => ({

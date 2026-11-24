@@ -1,3 +1,4 @@
+import {useComponentEnabled} from './component-context.jsx';
 import React, {useEffect, useLayoutEffect, useRef, useState} from 'react';
 import {createPortal} from 'react-dom';
 import {Mic, Square, X} from 'lucide-react';
@@ -219,6 +220,7 @@ function QuoteAnnotationEditor({
   const voiceKey = `quote:${threadId}:${quote.id}`;
   const update = value =>
     onChange(quote.id, current => current.map(item => (item.id === quote.id ? {...item, annotation: value} : item)));
+  const enabled = useComponentEnabled();
   const voice = useVoiceComposer({
     disabled,
     sessionKey: threadId,
@@ -292,7 +294,7 @@ function QuoteAnnotationEditor({
         }
         placeholder={placeholder}
       />
-      <div className="quote-voice-controls">
+      {(enabled('dictation') || voice.active) && <div className="quote-voice-controls">
         {voice.active ? (
           <>
             <button
@@ -330,7 +332,7 @@ function QuoteAnnotationEditor({
           </button>
         )}
         {(voice.notice || busyNotice) && <span role="status">{voice.notice || busyNotice}</span>}
-      </div>
+      </div>}
       {consent && (
         <section className="quote-voice-consent" aria-label="啟用聽寫">
           <strong>啟用現有聽寫？</strong>

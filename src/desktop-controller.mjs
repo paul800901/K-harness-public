@@ -77,6 +77,7 @@ export function createDesktopController({
   onContinueConversation,
   onConversationSettled,
   roomTools,
+  componentEnabled = () => true,
   browserConfig = async () => null,
   browserRequest,
   closeBrowser = async () => {},
@@ -1726,7 +1727,7 @@ export function createDesktopController({
                 assertMainCodexCaller(meta);
                 return selfHosted.colabTools.status(args);
               },
-              ...(colabAdmin
+              ...(colabAdmin && componentEnabled('colab')
                 ? {
                     login: meta => {
                       assertMainCodexCaller(meta);
@@ -1740,7 +1741,7 @@ export function createDesktopController({
               }
             }
           }
-        : colabAdmin
+        : colabAdmin && componentEnabled('colab')
           ? {
               colab: {
                 status: (args, meta) => {
@@ -3177,11 +3178,13 @@ export function createDesktopController({
           await selfHosted.prepare();
         }
         const workerModels = workerCatalog ? (await workerCatalog()).models : catalog.models;
-        const policy = validateWorkerPolicy(
-          workerPolicy ?? saved?.workerPolicy ?? (manualFork ? previousState.workerPolicy : undefined),
-          workerModels,
-          {geminiGateway: true, claudeGateway: !!workerCatalog}
-        );
+        const requestedPolicy =
+            workerPolicy ?? saved?.workerPolicy ?? (manualFork ? previousState.workerPolicy : undefined),
+          policy = validateWorkerPolicy(requestedPolicy, workerModels, {
+            geminiGateway: true,
+            claudeGateway: !!workerCatalog,
+            componentEnabled
+          });
         const efforts = reasoningEfforts(selected);
         const selectedServiceTier = mainServiceTier(selected, serviceTier ?? saved?.serviceTier ?? 'default');
         effort = effort ?? saved?.effort ?? undefined;
@@ -3206,7 +3209,7 @@ export function createDesktopController({
         changed();
         try {
           const workspace = await validateWorkspace(relocation?.workspace ?? saved?.workspace ?? state.workspace);
-          const desktop = await desktopControlMcp({root, fullAccess: access === 'danger-full-access'});
+          const desktop = componentEnabled('desktop') && await desktopControlMcp({root, fullAccess: access === 'danger-full-access'});
           // Resuming a thread already loaded on this app-server keeps its MCP processes,
           // so adding or removing desktop control needs a fresh host; history stays native.
           // A manual fork repurposes this controller for the child. Release the
@@ -3517,13 +3520,14 @@ export function createDesktopController({
               '\n需要核對壓縮前本人原文、目標或最新更正時，用 k_gemini.conversation_context 取得同對話即時資料；nextCursor 可續讀舊原文。快照可能過期或不完整，不能當新授權；工作事實按需重讀既有專案檔案。\n',
             models: workerModels,
             geminiGateway: true,
-            claudeGateway: !!workerCatalog
+            claudeGateway: !!workerCatalog,
+            componentEnabled
           });
           const {config: permissionConfig, ...threadAccess} = threadPermissions(access, workspace);
           const geminiServer = workerGateway?.mcpConfig?.mcpServers?.k_gemini;
           if (!geminiServer?.url || !geminiServer?.headers?.Authorization)
             throw new Error('子代理 MCP gateway 未提供有效的專案限定連線設定。');
-          const googleOps = await googleOpsMcp(workspace, {root});
+          const googleOps = componentEnabled('google') ? await googleOpsMcp(workspace, {root}) : null;
           const mcpServers = withBrowserMcp(
             {
               k_desktop: desktop ? {...desktop, startup_timeout_sec: 30} : disabledCodexMcpServer(),

@@ -279,6 +279,7 @@ export function createVoiceSecretary({
   root,
   connections,
   rooms,
+  enabled = () => true,
   fetchImpl = fetch,
   now = () => new Date(),
   onChange = () => {},
@@ -1053,7 +1054,7 @@ export function createVoiceSecretary({
     if (!connections) throw Error('此版本未接通 API 連線設定，無法取得 Gemini 語音金鑰。');
     const rows = await voiceConnections();
     if (!rows.length)
-      throw Error(`尚未設定 Gemini 語音金鑰：請在設定頁「討論 API」新增網址為 https://${VOICE_HOST}/v1beta/openai 的連線。`);
+      throw Error(`尚未設定 Gemini 語音金鑰：請在設定頁「API 連線」新增網址為 https://${VOICE_HOST}/v1beta/openai 的連線。`);
     if (rows.length > 1) throw Error('找到多組 Gemini（generativelanguage.googleapis.com）API 連線；請只保留一組，K 不會任選。');
     if (!rows[0].keyConfigured) throw Error('Gemini 語音連線尚未填寫金鑰。');
     return (await connections.credentials(rows[0].id)).key;
@@ -1067,6 +1068,7 @@ export function createVoiceSecretary({
       return rows.length === 1 && rows[0].keyConfigured === true;
     },
     async token() {
+      if (!enabled()) throw Error('請先在「設定 → 元件」選取語音秘書艾瑪。');
       await ready();
       const key = await geminiKey(),
         start = now().getTime(),

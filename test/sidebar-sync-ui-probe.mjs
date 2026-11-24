@@ -6,7 +6,7 @@ import path from 'node:path';
 import {mkdir, mkdtemp, writeFile, readFile} from 'node:fs/promises';
 import {launchProbeBrowser, probeEvidenceDir, probeTlsCertificate} from './ui-probe.mjs';
 import {scratchBase} from './scratch.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 import {remoteKeyHash} from '../src/remote-access.mjs';
 import {projectKey} from '../frontend/project-groups.mjs';
 const root = await mkdtemp(path.join(scratchBase, 'sidebar-sync-'));
@@ -56,7 +56,7 @@ const state = {
 };
 const service = () => ({status: async () => ({available: false}), progress: () => ({}), close: async () => {}});
 const start = () =>
-  startDesktop({
+  startConfiguredDesktop({
     root,
     port: 0,
     controllerFactory: () => ({

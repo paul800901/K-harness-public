@@ -34,6 +34,8 @@ test('isolated desktop does not grant human session via public GET or forged hea
     assert.equal(state.status, 200);
     assert.deepEqual(await state.json(), {
       threadId: 'fake',
+      components: null,
+      componentsError: null,
       dictationConfigured: false,
       followUpMode: 'queue',
       sidebarPreferences: null,

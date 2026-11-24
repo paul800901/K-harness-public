@@ -18,7 +18,13 @@ import {createApiWorker, API_OUTPUT_FILES_NOTE} from './api-worker.mjs';
 import {randomUUID} from 'node:crypto';
 import {createWorkerWatch, workerObservation, workerNeedsAttention, workerNoticeKey} from './worker-watch.mjs';
 
-import {normalizeWorkerPolicy, validateWorkerPolicy, workerTaskScope, WORKER_SERVICE_RULE} from './worker-policy.mjs';
+import {
+  normalizeWorkerPolicy,
+  validateWorkerPolicy,
+  workerComponent,
+  workerTaskScope,
+  WORKER_SERVICE_RULE
+} from './worker-policy.mjs';
 import {codexCommonContext, commonMemoryReference} from './common-memory.mjs';
 const safeId = value =>
   typeof value === 'string' && /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(value) && value !== '.' && value !== '..';
@@ -213,6 +219,7 @@ export async function createLunaBridge({
   apiFactory = createApiWorker,
   apiOptions = {},
   geminiOnly = false,
+  componentEnabled = () => true,
   onRequest,
   onChange = () => {},
   onGeminiHandoff = () => {},
@@ -591,7 +598,9 @@ export async function createLunaBridge({
     }
   };
   requestGuard = guardedRequest;
-  if (!geminiOnly)
+  if (!geminiOnly && !componentEnabled('codex'))
+    codexError = Error('Codex 在這個聊天室連線時未選為元件；加入後請重新開啟聊天室');
+  else if (!geminiOnly)
     try {
       if (!executable) throw Error('Codex executable 必須有效。');
       host = hostFactory({executable, cwd: root, onEvent: event, onRequest: message => requestGuard(message)});
@@ -688,6 +697,9 @@ export async function createLunaBridge({
       throw Error(
         '此入口只提供 Gemini、Claude、Grok 或 DeepSeek（及 API 諮詢模型）；GPT 子代理仍使用 Codex 原生派工。'
       );
+    // Work already dispatched can still be read, waited for and stopped.
+    if (choice.model !== 'auto' && !componentEnabled(workerComponent(choice.model)))
+      throw Error('這個模型所屬的元件未選取；請由使用者在「設定 → 元件」加入。未派工，也未改用其他模型。');
     if (isAntigravityModel(choice.model))
       return startProcess({provider: 'gemini', requestId, task, accountId, handoffFrom, ...choice});
     if (choice.model.startsWith('claude-')) {

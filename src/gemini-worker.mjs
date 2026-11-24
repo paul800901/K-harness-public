@@ -1014,6 +1014,7 @@ export function createGeminiWorker({
   timeoutMs = 0,
   gitStatus = geminiGitStatus,
   accounts,
+  componentEnabled = () => true,
   browserSession
 } = {}) {
   if (!Number.isFinite(timeoutMs) || timeoutMs < 0) throw Error('Flash timeoutMs 無效。');
@@ -1028,7 +1029,7 @@ export function createGeminiWorker({
   let catalog;
   async function prepare(targetHome = home, browserServer = null) {
     if (!binary) throw Error('找不到 Antigravity（agy，LOCALAPPDATA 未設定）；請在設定頁按 Antigravity「更新」下載官方核心，重開 K 後再登入。');
-    const googleOps = await googleOpsMcp(workspace, {root});
+    const googleOps = componentEnabled('google') ? await googleOpsMcp(workspace, {root}) : null;
     const projectMcp = await geminiProjectMcp(root, workspace, accessMode);
     await mkdir(path.join(targetHome, 'AppData', 'Local'), {recursive: true});
     await atomicWrite(

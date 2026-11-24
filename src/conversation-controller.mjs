@@ -1284,6 +1284,7 @@ export function createConversationController({
   voiceSecretary = createVoiceSecretary({
     root,
     connections: discussionApi,
+    enabled: () => options.componentEnabled?.('emma') !== false,
     rooms: {
       list: async () => (await roomTools.list()).rooms,
       session: async threadId => (await listMainSessions(root, {threadId})).sessions[0] ?? null,
@@ -1432,10 +1433,10 @@ export function createConversationController({
         })
       };
     },
-    models: () => catalog.models(),
+    models: threadId => catalog.models(threadId && active.state.threadId === threadId ? active.state.model : null),
     async usage(refresh = false) {
       // The voice secretary's monthly estimate rides along with the quotas; it never blocks or fails them.
-      const [shared, emma] = await Promise.all([catalog.usage(refresh), voiceSecretary.monthCost().catch(() => null)]);
+      const [shared, emma] = await Promise.all([catalog.usage(refresh), options.componentEnabled?.('emma') === false ? null : voiceSecretary.monthCost().catch(() => null)]);
       sharedUsage = {...shared, emma};
       onChange();
       return api.state.usage;
@@ -1691,11 +1692,12 @@ export function createConversationController({
     if (!discussionModes[settings?.mode]) throw Error('討論模式無效。');
     // Grok and the DeepSeek core are not discussion participants yet (no read-only participant entry);
     // DeepSeek can still join a discussion through its API connection.
-    const catalog = (await api.models()).models.filter(
+    // The room's own model always hosts, even when its AI is no longer a selected component.
+    const rows = (await catalog.models(s.threadId ? s.model : undefined)).models.filter(
       model => !['gemma', 'grok', 'deepseek'].includes(modelProvider(model.model))
     );
     const choose = choice => {
-      const model = catalog.find(m => m.model === choice.model && m.available !== false);
+      const model = rows.find(m => m.model === choice.model && m.available !== false);
       if (!model) throw Error('參與模型目前不在可用原生清單，未換模。');
       const effort = choice.effort || model.defaultReasoningEffort || null,
         efforts = (model.supportedReasoningEfforts ?? []).map(x => (typeof x === 'string' ? x : x.reasoningEffort));
@@ -1712,7 +1714,9 @@ export function createConversationController({
     const participants = await Promise.all(
       settings.participants.map(async (p, i) => {
         if (p.route && p.route !== 'api') throw Error('討論參與者路線無效。');
-        if (p.route === 'api' && !discussionApi) throw Error('此版本未接通討論 API。');
+        if (p.route === 'api' && (!discussionApi || options.componentEnabled?.('api') === false)) throw Error('API 諮詢模型未選為元件或尚未接通。');
+        if (p.route !== 'api' && options.componentEnabled?.(modelProvider(p.model)) === false)
+          throw Error('請先在「設定 → 元件」選取參與討論的核心。');
         return {...(p.route === 'api' ? await discussionApi.resolve(p) : choose(p)), id: `p${i + 1}`};
       })
     );

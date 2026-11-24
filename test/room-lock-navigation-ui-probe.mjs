@@ -5,7 +5,7 @@ import {fileURLToPath} from 'node:url';
 import {launchProbeBrowser, probeEvidenceDir} from './ui-probe.mjs';
 import {createConversationController} from '../src/conversation-controller.mjs';
 import {saveMainSession} from '../src/main-sessions.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 
 const base = probeEvidenceDir('room-lock-ui');
 await mkdir(base, {recursive: true});
@@ -94,7 +94,7 @@ for (const viewport of [
     };
     await controller.open({model});
     await entered.promise;
-    app = await startDesktop({
+    app = await startConfiguredDesktop({
       root,
       executable: 'fixture-only',
       port: 0,

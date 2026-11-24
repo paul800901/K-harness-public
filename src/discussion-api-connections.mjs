@@ -197,7 +197,7 @@ export function createDiscussionApiConnections({
     async credentials(id) {
       const row = await get(id),
         key = await vault.get(id);
-      if (!key || !row.keyConfigured) throw Error('請在設定填寫這個討論 API 的金鑰。');
+      if (!key || !row.keyConfigured) throw Error('請在設定填寫這個 API 連線的金鑰。');
       return {baseUrl: discussionApiBaseUrl(row.baseUrl), key};
     },
     save(data) {

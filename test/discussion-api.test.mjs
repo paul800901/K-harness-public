@@ -463,6 +463,11 @@ test('desktop API settings use existing authenticated explicit commands and neve
     const result = await post(data);
     assert.equal(result.status, 200);
     assert(!(await result.text()).includes(data.apiKey));
+    const selected = await fetch(app.origin + '/api/components', {
+      method: 'POST', headers: {cookie, 'Content-Type': 'application/json', 'X-K-Request': '1'},
+      body: JSON.stringify({components: ['api']})
+    });
+    assert.equal(selected.status, 200);
     const catalog = await (await fetch(app.origin + '/api/discussion/models', {headers: {cookie}})).json();
     assert.equal(catalog.models[0].route, 'api');
   } finally {

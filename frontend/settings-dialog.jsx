@@ -1,3 +1,5 @@
+import {componentIds, nativeCores, visibleProviders} from '../shared/components.mjs';
+import {useComponentEnabled} from './component-context.jsx';
 import React, {useState} from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
@@ -20,19 +22,37 @@ export function SettingsDialog({
   onFollowUpMode,
   mobile,
   archiveCount,
+  components,
+  onComponents,
   onUsage,
   onArchive,
   onLogout,
   onShutdown,
   onClose
 }) {
+  const enabled = useComponentEnabled();
   const [showFeatures, setShowFeatures] = useState(false);
   return (
     <Modal title="設定" onClose={onClose}>
       <section className="settings-section">
+        <h3 className="settings-section-label">元件</h3>
+        <div className="setting-row">
+          <span>
+            {components == null
+              ? '尚未選擇'
+              : components.length === componentIds.length
+                ? '目前顯示全部功能。'
+                : `已選 ${components.length} 項`}
+            <small>選擇 K 要顯示的功能。取消選取會保留登入、設定和聊天室。</small>
+          </span>
+          <button onClick={onComponents}>{components == null ? '選擇元件' : '更改元件'}</button>
+        </div>
+      </section>
+      <section className="settings-section">
         <h3 className="settings-section-label">{remoteClient ? '帳號與額度' : '帳號與核心'}</h3>
-        <AccountConnections defaultOpen disabled={disabled} />
-        {!remoteClient && <CoreUpdates />}
+        {['codex', 'claude', 'gemini', 'grok'].some(enabled) && <AccountConnections defaultOpen disabled={disabled} />}
+        {!remoteClient && [...nativeCores, 'gemma', 'colab'].some(enabled) && <CoreUpdates />}
+        {!visibleProviders(enabled).length && <p className="modal-description">尚未選擇 AI。</p>}
         {remoteClient && (
           <>
             <p className="modal-description">
@@ -117,10 +137,10 @@ export function SettingsDialog({
           </div>
         </div>
       </section>
-      <section className="settings-section">
-        <h3 className="settings-section-label">討論用 API 連線</h3>
+      {(enabled('api') || enabled('deepseek') || enabled('emma')) && <section className="settings-section">
+        <h3 className="settings-section-label">API 連線</h3>
         <DiscussionApiSettings request={api} disabled={remoteClient} />
-      </section>
+      </section>}
       <section className="settings-section">
         <h3 className="settings-section-label">資料</h3>
         <div className="setting-row">

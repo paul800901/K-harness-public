@@ -41,7 +41,7 @@ try {
   page.on('requestfailed', request => errors.push(`request failed: ${request.url()} ${request.failure()?.errorText}`));
   await page.goto(origin, {waitUntil: 'commit', timeout: 15000});
   try {
-    await page.getByText('尚未設定討論用 API 連線。').waitFor({timeout: 15000});
+    await page.getByText('尚未設定API 連線。').waitFor({timeout: 15000});
   } catch (error) {
     const diagnostic = await page.evaluate(() => ({
       body: document.body.innerHTML,
@@ -65,6 +65,7 @@ try {
     models = page.locator('.discussion-api-form textarea');
   assert.deepEqual(await provider.locator('option').evaluateAll(options => options.map(option => option.value)), [
     'deepseek',
+    'gemini-live',
     'glm',
     'kimi',
     'custom'
@@ -83,7 +84,7 @@ try {
   const stored = await page.evaluate(() => JSON.stringify({local: localStorage, session: sessionStorage}));
   assert.equal(stored.includes('FAKE-KEY-never-persist'), false);
   await page.getByRole('button', {name: '保存連線', exact: true}).click();
-  await page.getByText('討論用 API 連線已保存。', {exact: true}).waitFor();
+  await page.getByText('API 連線已保存。', {exact: true}).waitFor();
   let calls = await settingCalls();
   const saved = calls.find(call => call.route === 'discussion/connections/save');
   assert.deepEqual(saved.data.models, []);
@@ -142,13 +143,14 @@ try {
   assert.deepEqual(errors, []);
 
   for (const preset of [
+    {id: 'gemini-live', name: 'Gemini Live', url: 'https://generativelanguage.googleapis.com/v1beta/openai'},
     {id: 'glm', name: 'GLM', url: 'https://api.z.ai/api/paas/v4'},
     {id: 'kimi', name: 'Kimi', url: 'https://api.moonshot.cn/v1'}
   ]) {
     const presetPage = await browser.newPage();
     await presetPage.route('**/favicon.ico', route => route.fulfill({status: 204, body: ''}));
     await presetPage.goto(origin);
-    await presetPage.getByText('尚未設定討論用 API 連線。').waitFor();
+    await presetPage.getByText('尚未設定API 連線。').waitFor();
     await presetPage.getByRole('button', {name: '新增 API 連線', exact: true}).click();
     const form = presetPage.locator('.discussion-api-form'),
       providerField = form.locator('select'),
@@ -172,7 +174,7 @@ try {
     await keyField.fill('FAKE-PRESET-KEY');
     await urlField.fill(`${preset.url}/`);
     await presetPage.getByRole('button', {name: '保存連線', exact: true}).click();
-    await presetPage.getByText('討論用 API 連線已保存。', {exact: true}).waitFor();
+    await presetPage.getByText('API 連線已保存。', {exact: true}).waitFor();
     const presetSave = (await presetPage.evaluate(() => window.testRequestLog)).find(
       call => call.route === 'discussion/connections/save'
     );
@@ -207,7 +209,7 @@ try {
   const remote = await browser.newPage();
   await remote.route('**/favicon.ico', route => route.fulfill({status: 204, body: ''}));
   await remote.goto(`${origin}?remote=1`);
-  await remote.getByText('討論用 API 連線請在電腦端設定。', {exact: true}).waitFor();
+  await remote.getByText('API 連線請在電腦端設定。', {exact: true}).waitFor();
   assert.deepEqual(
     await remote.evaluate(() => window.testRequestLog),
     [],

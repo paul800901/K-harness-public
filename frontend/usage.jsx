@@ -1,3 +1,4 @@
+import {useComponentEnabled} from './component-context.jsx';
 import React, {useEffect, useRef, useState} from 'react';
 import {ChevronDown, RefreshCw} from 'lucide-react';
 import './usage.css';
@@ -61,6 +62,7 @@ const refreshUsage = async force => {
 };
 
 export function Usage({state, online, onDetails}) {
+  const enabled = useComponentEnabled();
   const quota = state.usage?.codex;
   const gemini = state.usage?.gemini,
     geminiHistorical = quotaIsHistorical(gemini, online);
@@ -88,7 +90,7 @@ export function Usage({state, online, onDetails}) {
       document.removeEventListener('visibilitychange', update);
       window.removeEventListener('k-gemini-usage-refresh', refreshOnAccountChange);
     };
-  }, [online, state.threadId]);
+  }, [online, state.threadId, enabled]);
   const stale = !online || quota?.status === 'stale';
   const windows = (quota?.windows ?? []).filter(w => Number.isFinite(w.remainingPercent));
   // The card starts folded to its title so the room list keeps the space; the corner chevron folds it again.
@@ -128,7 +130,7 @@ export function Usage({state, online, onDetails}) {
         onClick={onDetails}
       >
         <span className="usage-label">剩餘額度</span>
-        <span className="usage-row">
+        {enabled('codex') && (<span className="usage-row">
           <span className="usage-provider">Codex</span>
           <span className="usage-values">
             {windows.length
@@ -147,8 +149,8 @@ export function Usage({state, online, onDetails}) {
           </span>
           {stale && <em>舊</em>}
           <WeekBar percent={weekPercent(windows)} />
-        </span>
-        <span className="usage-row">
+        </span>)}
+        {enabled('claude') && (<span className="usage-row">
           <span className="usage-provider">Claude</span>
           <span className="usage-values">
             {state.usage?.claude?.windows?.some(w => w.remainingPercent != null)
@@ -172,8 +174,8 @@ export function Usage({state, online, onDetails}) {
           </span>
           {(!online || state.usage?.claude?.status === 'stale') && <em>舊</em>}
           <WeekBar percent={state.usage?.claude?.windows?.find(w => w.key === 'seven_day')?.remainingPercent} />
-        </span>
-        <span className="usage-row">
+        </span>)}
+        {enabled('gemini') && (<span className="usage-row">
           <span className="usage-provider">Gemini</span>
           <span className="usage-values">
             {!geminiHistorical && gemini?.windows?.length
@@ -201,8 +203,8 @@ export function Usage({state, online, onDetails}) {
                   : '上次查詢結果'}
             </span>
           </span>
-        </span>
-        <span className="usage-row">
+        </span>)}
+        {enabled('grok') && (<span className="usage-row">
           <span className="usage-provider">Grok</span>
           <span className="usage-values">
             {!quotaIsHistorical(state.usage?.grok, online) &&
@@ -220,16 +222,16 @@ export function Usage({state, online, onDetails}) {
           {!quotaIsHistorical(state.usage?.grok, online) && (
             <WeekBar percent={weekPercent(state.usage?.grok?.windows)} />
           )}
-        </span>
-        <span className="usage-row">
+        </span>)}
+        {enabled('deepseek') && (<span className="usage-row">
           <span className="usage-provider">DeepSeek</span>
           <span className="usage-values">
             <span className={state.usage?.deepseek?.balance?.available === false ? 'warning' : undefined}>
               {deepseekBalanceText(state.usage?.deepseek, online)}
             </span>
           </span>
-        </span>
-        {state.usage?.emma && (
+        </span>)}
+        {enabled('emma') && state.usage?.emma && (
           <span className="usage-row">
             <span className="usage-provider">{SECRETARY_NAME}</span>
             <span className="usage-values">
@@ -248,6 +250,7 @@ export function Usage({state, online, onDetails}) {
 }
 
 export function UsageDetails({state, online}) {
+  const enabled = useComponentEnabled();
   const [refreshing, setRefreshing] = useState(false),
     [error, setError] = useState(''),
     [notice, setNotice] = useState(''),
@@ -275,7 +278,7 @@ export function UsageDetails({state, online}) {
     try {
       const updated = await refreshUsage(true);
       acceptUsage(updated);
-      if (updated.gemini?.accounts?.length) {
+      if (enabled('gemini') && updated.gemini?.accounts?.length) {
         const response = await fetch('/api/gemini/accounts/refresh-all', {
           method: 'POST',
           headers: {'Content-Type': 'application/json', 'X-K-Request': '1', 'X-K-Command': crypto.randomUUID()},
@@ -362,8 +365,8 @@ export function UsageDetails({state, online}) {
           {notice}
         </p>
       )}
-      {usage?.emma && <EmmaMonth emma={usage.emma} />}
-      <section className="usage-provider-section" aria-label="Claude 訂閱剩餘額度">
+      {enabled('emma') && usage?.emma && <EmmaMonth emma={usage.emma} />}
+      {enabled('claude') && (<section className="usage-provider-section" aria-label="Claude 訂閱剩餘額度">
         <div className="usage-heading">
           <strong>Claude 訂閱剩餘額度</strong>
         </div>
@@ -403,8 +406,8 @@ export function UsageDetails({state, online}) {
             推算。
           </p>
         </details>
-      </section>
-      <section className="usage-provider-section" aria-label="GPT / Codex 訂閱剩餘額度">
+      </section>)}
+      {enabled('codex') && (<section className="usage-provider-section" aria-label="GPT / Codex 訂閱剩餘額度">
         <div className="usage-heading">
           <strong>GPT / Codex 訂閱剩餘額度</strong>
         </div>
@@ -463,8 +466,8 @@ export function UsageDetails({state, online}) {
           </div>
           <p className="usage-note">約每分鐘更新；額度歸零時等待官方重設，人工更新可重查。</p>
         </details>
-      </section>
-      <section className="usage-provider-section" aria-label="Gemini / Antigravity 訂閱剩餘額度">
+      </section>)}
+      {enabled('gemini') && (<section className="usage-provider-section" aria-label="Gemini / Antigravity 訂閱剩餘額度">
         <div className="usage-heading">
           <strong>Gemini / Antigravity 訂閱剩餘額度</strong>
           {geminiAccounts.length > 0 && (
@@ -605,8 +608,8 @@ export function UsageDetails({state, online}) {
             </details>
           </>
         )}
-      </section>
-      <section className="usage-provider-section" aria-label="Grok 訂閱剩餘額度">
+      </section>)}
+      {enabled('grok') && (<section className="usage-provider-section" aria-label="Grok 訂閱剩餘額度">
         <div className="usage-heading">
           <strong>Grok 訂閱剩餘額度{usage?.grok?.plan ? `（${usage.grok.plan}）` : ''}</strong>
         </div>
@@ -638,8 +641,8 @@ export function UsageDetails({state, online}) {
           </div>
           <p className="usage-note">直接查詢 Grok 官方帳務資料，約每分鐘更新；不以 Token 推算。</p>
         </details>
-      </section>
-      <DeepSeekBalance quota={usage?.deepseek} online={online} />
+      </section>)}
+      {enabled('deepseek') && <DeepSeekBalance quota={usage?.deepseek} online={online} />}
     </section>
   );
 }

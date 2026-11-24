@@ -26,6 +26,7 @@ import {
 export function createUnifiedController(options) {
   const {
     root,
+    componentEnabled = () => true,
     onChange = () => {},
     codexFactory = createDesktopController,
     claudeFactory = createClaudeController,
@@ -52,9 +53,19 @@ export function createUnifiedController(options) {
     onChange();
     if (!changing) queue?.schedule();
   };
+  const componentOf = model => {
+    const provider = modelProvider(model);
+    return provider === 'gemma' &&
+      gemmaConnections.find(connection => connection.slot === gemmaConnection(model))?.colabAdmin
+      ? 'colab'
+      : provider;
+  };
+  // A deselected AI's rooms stay usable, so the open (or opening) room's own core stays in its catalog.
+  let openingModel;
+  const roomModel = () => openingModel ?? (active.state.threadId ? active.state.model : undefined);
   // The user's API connections are consult workers only: they join the worker catalog, never the main models.
   const workerCatalog = async () => {
-    const catalog = await api.models();
+    const catalog = await api.models(null);
     return {...catalog, models: [...catalog.models, ...(catalog.apiModels ?? [])]};
   };
   const codex = codexFactory({
@@ -187,7 +198,7 @@ export function createUnifiedController(options) {
       };
     },
     async usage(refresh = false) {
-      claude ??= claudeFactory({
+      if (componentEnabled('claude')) claude ??= claudeFactory({
         ...options,
         workerCatalog,
         onChange() {
@@ -195,11 +206,11 @@ export function createUnifiedController(options) {
         }
       });
       await Promise.all([
-        claude.usage(refresh),
-        codex.usage(refresh),
-        getGemini().usage(refresh),
-        getGrok().usage(refresh),
-        getDeepSeek().usage(refresh)
+        componentEnabled('claude') && claude.usage(refresh),
+        componentEnabled('codex') && codex.usage(refresh),
+        componentEnabled('gemini') && getGemini().usage(refresh),
+        componentEnabled('grok') && getGrok().usage(refresh),
+        componentEnabled('deepseek') && getDeepSeek().usage(refresh)
       ]);
       onChange();
       return api.state.usage;
@@ -275,8 +286,10 @@ export function createUnifiedController(options) {
       if (workspace !== active.state.workspace || active !== source) throw new Error('工作區已切換，搜尋結果已捨棄。');
       return {files: normalizeNativeFileSearchResults(response, workspace)};
     },
-    async models() {
-      claude ??= claudeFactory({
+    async models(includeModel = roomModel()) {
+      const own = includeModel ? componentOf(includeModel) : undefined;
+      const listCore = id => componentEnabled(id) || id === own;
+      if (listCore('claude')) claude ??= claudeFactory({
         ...options,
         workerCatalog,
         onChange() {
@@ -284,12 +297,12 @@ export function createUnifiedController(options) {
         }
       });
       const [gpt, anthropic, google, xai, dsh, ...selfHosted] = await Promise.allSettled([
-        codex.models(),
-        claude.models(),
-        getGemini().models(),
-        getGrok().models(),
-        getDeepSeek().models(),
-        ...gemmaConnections.map(connection => connection.models())
+        listCore('codex') && codex.models(),
+        listCore('claude') && claude.models(),
+        listCore('gemini') && getGemini().models(),
+        listCore('grok') && getGrok().models(),
+        listCore('deepseek') && getDeepSeek().models(),
+        ...gemmaConnections.filter(connection => listCore(connection.colabAdmin ? 'colab' : 'gemma')).map(connection => connection.models())
       ]);
       const models = [],
         warnings = [],
@@ -302,11 +315,12 @@ export function createUnifiedController(options) {
         ['deepseek', dsh],
         ...selfHosted.map(result => ['gemma', result])
       ]) {
+        if (result.status === 'fulfilled' && !result.value) continue;
         if (result.status === 'fulfilled')
           models.push(...result.value.models.filter(m => m.hidden !== true).map(m => ({...m, provider})));
         else warnings.push(`${provider} 目錄暫時不可用：${String(result.reason?.message ?? result.reason)}`);
       }
-      if (workerApi)
+      if (workerApi && componentEnabled('api'))
         try {
           apiModels.push(...(await apiWorkerRows(workerApi)));
         } catch (error) {
@@ -316,8 +330,9 @@ export function createUnifiedController(options) {
         models,
         warnings,
         apiModels,
-        geminiGateway: gpt.status === 'fulfilled' && gpt.value.geminiGateway === true,
-        claudeGateway: anthropic.status === 'fulfilled'
+        // Every main core has K's gateway; an unlisted Codex says nothing about it.
+        geminiGateway: gpt.status === 'fulfilled' && (!gpt.value || gpt.value.geminiGateway === true),
+        claudeGateway: anthropic.status === 'fulfilled' && !!anthropic.value
       };
     },
     async open(data, {signal, onHistory, continuation, onCreated} = {}) {
@@ -331,6 +346,10 @@ export function createUnifiedController(options) {
         if (data.threadId && !saved) throw notCreatedError(new Error('只能開啟 K 清單中的對話。'));
         const provider = modelProvider(saved?.model ?? data.model),
           isClaude = provider === 'claude';
+        // A continuation's target was already resolved from its source room's own catalog.
+        if (!saved && !continuation && !componentEnabled(componentOf(data.model)))
+          throw notCreatedError(new Error('請先在「設定 → 元件」選取這個 AI。'));
+        openingModel = saved?.model ?? data.model;
         if (saved && saved.model !== data.model) throw notCreatedError(new Error('對話設定已更新，請重新整理清單。'));
         if (isClaude) {
           const auth = await abortable(inspect({cwd: root, signal}), signal).catch(error => {
@@ -411,6 +430,7 @@ export function createUnifiedController(options) {
         }
         throw error;
       } finally {
+        openingModel = undefined;
         changing = false;
       }
     },
@@ -517,7 +537,7 @@ export function createUnifiedController(options) {
           throw Error('Grok 尚未接入原生分支；請建立新對話，或明確交接到其他供應商。');
         if (same && targetProvider === 'deepseek')
           throw Error('DeepSeek 尚未接入原生分支；請建立新對話，或明確交接到其他供應商。');
-        const selected = (await api.models()).models.find(m => m.model === model && m.available !== false);
+        const selected = (await api.models(null)).models.find(m => m.model === model && m.available !== false);
         if (!selected) throw Error('所選模型目前不可用。');
         const efforts = (selected.supportedReasoningEfforts ?? []).map(x =>
           typeof x === 'string' ? x : x.reasoningEffort
@@ -538,6 +558,7 @@ export function createUnifiedController(options) {
           throw Error('切換到 Claude 完整存取權前，必須明確確認 permissionConfirmed:true；分支未建立。');
         let handoff;
         assertSourceCurrent();
+        openingModel = model;
         if (same) {
           created = await active.fork({messageId, model, effort, accessMode, permissionConfirmed}, assertSourceCurrent);
         } else {
@@ -615,6 +636,7 @@ export function createUnifiedController(options) {
         }
         throw error;
       } finally {
+        openingModel = undefined;
         changing = false;
         changed();
       }

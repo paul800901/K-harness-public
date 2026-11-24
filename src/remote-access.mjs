@@ -280,6 +280,7 @@ const writes = new Set([
   '/api/gemini/accounts/cancel',
   '/api/gemini/accounts/logout',
   '/api/sidebar/preferences',
+  '/api/components',
   '/api/follow-up-mode',
   '/api/discussion/message',
   '/api/dictation/prepare',

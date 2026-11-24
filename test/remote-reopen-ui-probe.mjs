@@ -5,7 +5,7 @@ import https from 'node:https';
 import path from 'node:path';
 import {mkdir, mkdtemp, writeFile} from 'node:fs/promises';
 import {launchProbeContext, probeEvidenceDir, probeTlsCertificate} from './ui-probe.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 import {remoteKeyHash} from '../src/remote-access.mjs';
 const base = probeEvidenceDir('remote-reopen-20261007');
 await mkdir(base, {recursive: true});
@@ -42,7 +42,7 @@ const state = {
   workerActivity: {running: 0, uncertain: false, unconfirmed: 0}
 };
 const service = () => ({status: async () => ({available: false}), close: async () => {}});
-const app = await startDesktop({
+const app = await startConfiguredDesktop({
   root,
   port: 0,
   controllerFactory: () => ({

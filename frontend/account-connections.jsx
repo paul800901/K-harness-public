@@ -1,3 +1,4 @@
+import {useComponentEnabled} from './component-context.jsx';
 import React, {useEffect, useMemo, useRef, useState} from 'react';
 import {ChevronDown, RefreshCw} from 'lucide-react';
 import {officialClaudeLoginUrl as officialLoginUrl} from '../shared/claude-login-url.mjs';
@@ -16,6 +17,9 @@ export function AccountConnections({
   onStatus,
   onRefresh
 }) {
+  const selected = useComponentEnabled();
+  // Switching models in a deselected AI's existing room still needs that AI's own login state.
+  const enabled = id => selected(id) || (hidden && id === provider);
   const [claudeStatus, setClaudeStatus] = useState(null),
     [claudeLoading, setClaudeLoading] = useState(true),
     [claudeAction, setClaudeAction] = useState(false);
@@ -230,12 +234,12 @@ export function AccountConnections({
     }
   };
   useEffect(() => {
-    refreshClaudeStatus();
-    refreshCodexStatus();
-    refreshGeminiStatus();
-    refreshGeminiAccounts();
-    refreshGrokStatus();
-  }, []);
+    if (enabled('claude')) refreshClaudeStatus();
+    if (enabled('codex')) refreshCodexStatus();
+    if (enabled('gemini')) refreshGeminiStatus();
+    if (enabled('gemini')) refreshGeminiAccounts();
+    if (enabled('grok')) refreshGrokStatus();
+  }, [selected]);
   const updateClaudeLogin = async (route, data = {}) => {
     setClaudeAction(true);
     setClaudeLoginNotice('');
@@ -485,13 +489,13 @@ export function AccountConnections({
       <summary aria-label="帳號連線">
         <span>帳號連線</span>
         <span className="account-summary">
-          <span className={codexVerified ? 'connected' : ''}>
+          {enabled('codex') && (<span className={codexVerified ? 'connected' : ''}>
             GPT {codexLoading ? '讀取中' : codexVerified ? '已連線' : '未連線'}
-          </span>
-          <span className={claudeVerified ? 'connected' : ''}>
+          </span>)}
+          {enabled('claude') && (<span className={claudeVerified ? 'connected' : ''}>
             Claude {claudeLoading ? '讀取中' : claudeVerified ? '已連線' : '未連線'}
-          </span>
-          <span className={geminiActiveVerified ? 'connected' : ''}>
+          </span>)}
+          {enabled('gemini') && (<span className={geminiActiveVerified ? 'connected' : ''}>
             Gemini{' '}
             {geminiAccountsLoading || geminiLoading
               ? '確認中'
@@ -502,8 +506,8 @@ export function AccountConnections({
                   : geminiStatus?.installed === false
                     ? '未安裝'
                     : '尚未確認'}
-          </span>
-          <span className={grokVerified ? 'connected' : ''}>
+          </span>)}
+          {enabled('grok') && (<span className={grokVerified ? 'connected' : ''}>
             Grok{' '}
             {grokLoading
               ? '確認中'
@@ -514,11 +518,11 @@ export function AccountConnections({
                   : grokStatus?.installed === false
                     ? '未安裝'
                     : '尚未確認'}
-          </span>
+          </span>)}
           <ChevronDown size={14} />
         </span>
       </summary>
-      <div className="provider-auth-row">
+      {enabled('codex') && (<div className="provider-auth-row">
         <div className="provider-auth-copy">
           <strong>GPT / Codex 訂閱</strong>
           <span>{codexStatusText}</span>
@@ -576,8 +580,8 @@ export function AccountConnections({
             <small role="status">登入流程已結束，但目前尚未確認可用的 ChatGPT 訂閱。</small>
           )}
         </div>
-      </div>
-      <div className="provider-auth-row">
+      </div>)}
+      {enabled('grok') && (<div className="provider-auth-row">
         <div className="provider-auth-copy">
           <strong>Grok 訂閱</strong>
           <span>{grokStatusText}</span>
@@ -639,8 +643,8 @@ export function AccountConnections({
           )}
           {grokNotice && <small role="status">{grokNotice}</small>}
         </div>
-      </div>
-      <div className="provider-auth-row">
+      </div>)}
+      {enabled('claude') && (<div className="provider-auth-row">
         <div className="provider-auth-copy">
           <strong>Claude 訂閱</strong>
           <span>{claudeStatusText}</span>
@@ -729,8 +733,8 @@ export function AccountConnections({
             <small role="status">登入流程已結束，但目前尚未確認可用的 Claude 訂閱。</small>
           )}
         </div>
-      </div>
-      <div className="provider-auth-row gemini-account-row">
+      </div>)}
+      {enabled('gemini') && (<div className="provider-auth-row gemini-account-row">
         <div className="provider-auth-copy">
           <strong>Gemini / Antigravity 訂閱</strong>
           <span>
@@ -1021,7 +1025,7 @@ export function AccountConnections({
           )}
           {geminiNotice && <small role="status">{geminiNotice}</small>}
         </div>
-      </div>
+      </div>)}
     </details>
   );
 }

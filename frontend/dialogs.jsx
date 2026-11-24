@@ -1,3 +1,5 @@
+import {visibleProviders} from '../shared/components.mjs';
+import {useComponentEnabled} from './component-context.jsx';
 import {
   PermissionPicker,
   claudePermissionModes,
@@ -184,6 +186,7 @@ export function ArchiveManager({
 }
 
 export function BranchDialog({modal, state, onClose, onFork}) {
+  const enabled = useComponentEnabled();
   const inheritedAccess =
     modal.sourceProvider === 'claude'
       ? state.accessMode === 'workspace-write'
@@ -192,12 +195,16 @@ export function BranchDialog({modal, state, onClose, onFork}) {
           ? 'claude-plan'
           : (state.accessMode ?? 'claude-manual')
       : (state.accessMode ?? 'workspace-write');
-  const [targetProvider, setTargetProvider] = useState(modal.targetProvider ?? modal.sourceProvider),
+  const providers = visibleProviders(enabled);
+  const listed = id => providers.includes(id);
+  const canBranch = id => id !== modal.sourceProvider || id === 'codex' || id === 'gemma' || (id === 'claude' && modal.claudeNativeFork);
+  const initialProvider = [modal.targetProvider, ...providers].find(id => listed(id) && canBranch(id)) ?? '';
+  const [targetProvider, setTargetProvider] = useState(initialProvider),
     [catalog, setCatalog] = useState([]),
     [model, setModel] = useState(''),
     [effort, setEffort] = useState(''),
     [accessMode, setAccessMode] = useState(
-      modal.sourceProvider === (modal.targetProvider ?? modal.sourceProvider) ? inheritedAccess : ''
+      modal.sourceProvider === initialProvider ? inheritedAccess : ''
     ),
     [permissionConfirmed, setPermissionConfirmed] = useState(false),
     [nextInstruction, setNextInstruction] = useState(''),
@@ -285,20 +292,21 @@ export function BranchDialog({modal, state, onClose, onFork}) {
             setEffort('');
           }}
         >
-          <option value="codex">GPT / Codex 訂閱</option>
-          <option value="gemma">自架</option>
-          <option value="claude" disabled={!modal.claudeNativeFork && modal.sourceProvider === 'claude'}>
+          {!initialProvider && <option value="">尚無可用的分支目標</option>}
+          {listed('codex') && <option value="codex">GPT / Codex 訂閱</option>}
+          {listed('gemma') && <option value="gemma">自架</option>}
+          {listed('claude') && <option value="claude" disabled={!modal.claudeNativeFork && modal.sourceProvider === 'claude'}>
             Claude 訂閱
-          </option>
-          <option value="gemini" disabled={modal.sourceProvider === 'gemini'}>
+          </option>}
+          {listed('gemini') && <option value="gemini" disabled={modal.sourceProvider === 'gemini'}>
             Gemini / Antigravity 訂閱
-          </option>
-          <option value="grok" disabled={modal.sourceProvider === 'grok'}>
+          </option>}
+          {listed('grok') && <option value="grok" disabled={modal.sourceProvider === 'grok'}>
             Grok 訂閱
-          </option>
-          <option value="deepseek" disabled={modal.sourceProvider === 'deepseek'}>
+          </option>}
+          {listed('deepseek') && <option value="deepseek" disabled={modal.sourceProvider === 'deepseek'}>
             DeepSeek（API 計費）
-          </option>
+          </option>}
         </select>
       </label>
       <label className="setting-row">

@@ -208,6 +208,7 @@ export function createGeminiController({
   accounts,
   onChange = () => {},
   timeoutMs = 0,
+  componentEnabled = () => true,
   browserConfig = async () => null,
   closeBrowser = async () => {},
   bridgeFactory = null,
@@ -763,6 +764,7 @@ export function createGeminiController({
         models: (await workerCatalog()).models,
         geminiGateway: true,
         claudeGateway: true,
+        componentEnabled,
         provider: 'gemini'
       }).developer_instructions;
     const parent = state.threadId,
@@ -932,7 +934,7 @@ export function createGeminiController({
           }
         : {}),
       // Read-only Colab entry (sign-in and eligibility; no runtime or inference).
-      ...(colabAdmin
+      ...(colabAdmin && componentEnabled('colab')
         ? {
             colab: {
               status: args => {
@@ -981,8 +983,8 @@ export function createGeminiController({
     const temps = Object.entries(env)
       .filter(([key]) => /^(TEMP|TMP)$/iu.test(key))
       .map(([, value]) => value);
-    const googleOps = await googleOpsMcp(state.workspace, {root});
-    const desktop = await desktopControlMcp({root, fullAccess: state.accessMode === 'danger-full-access'});
+    const googleOps = componentEnabled('google') ? await googleOpsMcp(state.workspace, {root}) : null;
+    const desktop = componentEnabled('desktop') && await desktopControlMcp({root, fullAccess: state.accessMode === 'danger-full-access'});
     const projectMcp = await geminiProjectMcp(root, state.workspace, state.accessMode);
     const settings = geminiSettings(state.workspace, state.accessMode, temps, browserServer, googleOps, projectMcp, {
       writable: [sharedRules],

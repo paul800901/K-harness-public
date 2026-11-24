@@ -1,3 +1,5 @@
+import {visibleProviders} from '../shared/components.mjs';
+import {useComponentEnabled} from './component-context.jsx';
 import React, {useEffect, useRef, useState, useId} from 'react';
 import {Check, ChevronDown, RefreshCw} from 'lucide-react';
 import {availableWorkerModels, normalizeWorkerPolicy} from '../src/worker-policy.mjs';
@@ -237,11 +239,15 @@ export function ModelPicker({
   geminiGateway = false,
   loadModels,
   onCatalog,
+  onSettings,
   onClose,
   onCreate
 }) {
+  const enabled = useComponentEnabled();
+  const providers = visibleProviders(enabled);
+  const firstProvider = providers[0];
   const [models, setModels] = useState([]),
-    [provider, setProvider] = useState(mode === 'switch' ? modelProvider({model: currentModel}) : 'codex'),
+    [provider, setProvider] = useState(mode === 'switch' ? modelProvider({model: currentModel}) : firstProvider),
     [model, setModel] = useState(''),
     [effort, setEffort] = useState(undefined),
     [loading, setLoading] = useState(true),
@@ -253,10 +259,10 @@ export function ModelPicker({
   // API connections are consult workers: listed beside the catalog, never among the main models.
   const [apiModels, setApiModels] = useState([]);
   const [workerPolicy, setWorkerPolicy] = useState(() => normalizeWorkerPolicy(currentWorkerPolicy));
-  const [accessMode, setAccessMode] = useState(providerDefaultPermission('codex')),
+  const [accessMode, setAccessMode] = useState(providerDefaultPermission(firstProvider)),
     [permissionConfirmed, setPermissionConfirmed] = useState(false);
   const [serviceTier, setServiceTier] = useState('default');
-  const initializedProvider = useRef(mode === 'switch' ? modelProvider({model: currentModel}) : 'codex');
+  const initializedProvider = useRef(mode === 'switch' ? modelProvider({model: currentModel}) : firstProvider);
 
   const refreshModels = async kind => {
     try {
@@ -271,13 +277,13 @@ export function ModelPicker({
       onCatalog(list, catalog.warnings ?? []);
       setError('');
       setLoading(false);
-      if (kind === 'codex') {
-        const currentProvider = modelProvider({model: currentModel}),
-          choices = mode === 'switch' ? list.filter(item => modelProvider(item) === currentProvider) : list;
+      if (kind === provider) {
+        // A finished login fills its own tab; it never moves the person to another provider.
+        const choices = list.filter(item => modelProvider(item) === kind);
         const initial =
           choices.find(item => item.model === currentModel)?.model ??
           choices.find(item => item.isDefault && item.available !== false)?.model ??
-          choices.find(item => item.available !== false && modelProvider(item) === 'codex')?.model ??
+          choices.find(item => item.available !== false)?.model ??
           choices[0]?.model ??
           '';
         if (!model || !list.some(item => item.model === model)) {
@@ -355,7 +361,7 @@ export function ModelPicker({
     ['pro', 'max', 'team', 'enterprise'].includes(auth?.subscriptionType);
   const isAvailable = item => item?.available !== false && (modelProvider(item) !== 'claude' || claudeVerified);
   const supportedEfforts = selected?.supportedReasoningEfforts ?? [];
-  const workerModels = availableWorkerModels([...models, ...apiModels], {
+  const workerModels = availableWorkerModels([...models.filter(item => enabled(modelProvider(item))), ...(enabled('api') ? apiModels : [])], {
     provider,
     geminiGateway: provider === 'claude' || catalogGeminiGateway,
     claudeGateway: catalogClaudeGateway
@@ -459,14 +465,14 @@ export function ModelPicker({
             <div className="model-picker-flow">
               <div className="model-setting-row">
                 <span>提供者</span>
-                {mode === 'switch' ? (
+                {mode === 'switch' || providers.length === 1 ? (
                   <span className="model-provider-fixed">
                     {providerLabel(provider)}
-                    <small>既有對話維持同一提供者</small>
+                    {mode === 'switch' && <small>既有對話維持同一提供者</small>}
                   </span>
                 ) : (
                   <div className="model-provider-tabs" role="group" aria-label="選擇主代理提供者">
-                    {['codex', 'claude', 'gemini', 'grok', 'deepseek', 'gemma'].map(item => (
+                    {providers.map(item => (
                       <button
                         type="button"
                         key={item}
@@ -491,6 +497,14 @@ export function ModelPicker({
                     isAvailable={isAvailable}
                     onChange={chooseModel}
                   />
+                  {mode === 'create' && onSettings && !visibleModels.some(isAvailable) && (
+                    <p className="step-hint">
+                      {providerLabel(provider)} 尚未完成設定。{' '}
+                      <button type="button" onClick={onSettings}>
+                        繼續設定
+                      </button>
+                    </p>
+                  )}
                   {billingNote(selected) && (
                     <p className="model-billing-note" role="note">
                       {billingNote(selected)}

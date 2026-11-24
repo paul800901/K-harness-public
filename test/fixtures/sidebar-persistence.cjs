@@ -20,7 +20,7 @@ const wait = async check => {
 (async () => {
   await electron.app.whenReady();
   await mkdir(root, {recursive: true});
-  const {startDesktop} = await import(pathToFileURL(path.join(repo, 'src/desktop-server.mjs')));
+  const {startConfiguredDesktop} = await import(pathToFileURL(path.join(repo, 'test/configured-desktop.mjs')));
   const {createElectronWorkbench} = await import(
     pathToFileURL(process.env.K_SIDEBAR_PROBE_MODULE || path.join(repo, 'src/electron-workbench.mjs'))
   );
@@ -61,7 +61,7 @@ const wait = async check => {
     }
   });
   const port = mode === 'write' ? 0 : Number(await readFile(path.join(root, 'port.txt'), 'utf8'));
-  server = await startDesktop({
+  server = await startConfiguredDesktop({
     root,
     port,
     controllerFactory: () => ({

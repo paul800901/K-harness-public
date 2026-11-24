@@ -172,6 +172,7 @@ export function createClaudeController({
   onChange = () => {},
   onContinueConversation,
   onConversationSettled,
+  componentEnabled = () => true,
   browserConfig = async () => null,
   closeBrowser = async () => {},
   invalidateInspection = invalidateClaudeInspection,
@@ -1545,6 +1546,7 @@ export function createClaudeController({
         models: (await workerCatalog()).models,
         geminiGateway: true,
         claudeGateway: true,
+        componentEnabled,
         provider: 'claude'
       };
       workerInstructions = workerPolicyConfig(state.workerPolicy, options).developer_instructions;
@@ -1805,7 +1807,7 @@ export function createClaudeController({
           }
         : {}),
       // Read-only Colab entry (sign-in and eligibility; no runtime or inference).
-      ...(colabAdmin
+      ...(colabAdmin && componentEnabled('colab')
         ? {
             colab: {
               status: args => {
@@ -1826,8 +1828,8 @@ export function createClaudeController({
     const browserServer = toClaudeBrowserMcpServer(
       await browserConfig({appRoot: root, conversationId, accessMode, provider: 'claude'})
     );
-    const googleOps = await googleOpsMcp(state.workspace, {root});
-    const desktop = await desktopControlMcp({
+    const googleOps = componentEnabled('google') ? await googleOpsMcp(state.workspace, {root}) : null;
+    const desktop = componentEnabled('desktop') && await desktopControlMcp({
       root,
       fullAccess: claudePermissionMode(accessMode) === 'bypassPermissions'
     });

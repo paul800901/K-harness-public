@@ -1,6 +1,8 @@
+import {useComponentEnabled} from './component-context.jsx';
 import React, {useState} from 'react';
 
 export function CoreUpdates() {
+  const enabled = useComponentEnabled();
   const [busy, setBusy] = useState(false),
     [notice, setNotice] = useState('');
   const update = async provider => {
@@ -31,9 +33,9 @@ export function CoreUpdates() {
           ['gemini', 'Antigravity'],
           ['grok', 'Grok Build'],
           ['deepseek', 'DeepSeek Harness']
-        ].map(([provider, label]) => (
+        ].filter(([provider]) => enabled(provider) || (provider === 'codex' && (enabled('gemma') || enabled('colab')))).map(([provider, label]) => (
           <button type="button" key={provider} disabled={busy} onClick={() => update(provider)}>
-            更新 {label}
+            {provider === 'codex' && !enabled('codex') ? '下載 Codex 程式' : `更新 ${label}`}
           </button>
         ))}
       </div>

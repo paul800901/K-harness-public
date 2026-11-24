@@ -8,7 +8,7 @@ import {mkdir, mkdtemp, readFile, writeFile} from 'node:fs/promises';
 import {randomBytes} from 'node:crypto';
 import {launchProbeBrowser, probeEvidenceDir, probeTlsCertificate} from './ui-probe.mjs';
 import {scratchBase} from './scratch.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 import {saveAttachmentStream} from '../src/desktop-files.mjs';
 import {remoteKeyHash} from '../src/remote-access.mjs';
 import {decodePcm16Mono16kWav} from '../src/local-dictation.mjs';
@@ -267,7 +267,7 @@ const service = () => ({
   }),
   close: async () => {}
 });
-const app = await startDesktop({
+const app = await startConfiguredDesktop({
   root,
   port: 0,
   geminiAccounts: {

@@ -6,7 +6,7 @@ import path from 'node:path';
 import {mkdir, mkdtemp, writeFile, readFile} from 'node:fs/promises';
 import {launchProbeBrowser, probeEvidenceDir, probeTlsCertificate} from './ui-probe.mjs';
 import {scratchBase} from './scratch.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 import {remoteKeyHash} from '../src/remote-access.mjs';
 
 const root = await mkdtemp(path.join(scratchBase, 'update-recovery-'));
@@ -63,7 +63,7 @@ let closes = 0,
   closeTask,
   app,
   browser;
-app = await startDesktop({
+app = await startConfiguredDesktop({
   root,
   port: 0,
   controllerFactory: () => ({

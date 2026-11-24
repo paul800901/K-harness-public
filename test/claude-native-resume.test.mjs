@@ -4,7 +4,7 @@ import {mkdir, mkdtemp, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {createConversationController} from '../src/conversation-controller.mjs';
 import {createClaudeController} from '../src/claude-controller.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 import {scratchBase} from './scratch.mjs';
 
 // Event shapes follow Claude Code 2.1.322 (the selected K core): resuming a stopped/failed
@@ -40,8 +40,8 @@ async function desktopWithRealClaude() {
     hosts.push(host);
     return host;
   };
-  const app = await startDesktop({
-    root: path.resolve('.'),
+  const app = await startConfiguredDesktop({
+    root,
     port: 0,
     requireLaunchToken: true,
     controllerFactory: options =>

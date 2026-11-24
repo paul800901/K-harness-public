@@ -7,7 +7,7 @@ import path from 'node:path';
 import {mkdir, mkdtemp, writeFile} from 'node:fs/promises';
 import {randomBytes} from 'node:crypto';
 import {launchProbeBrowser, probeEvidenceDir, probeTlsCertificate} from './ui-probe.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 import {remoteKeyHash} from '../src/remote-access.mjs';
 import {decodePcm16Mono16kWav} from '../src/local-dictation.mjs';
 
@@ -144,7 +144,7 @@ const login = () => ({
   },
   async close() {}
 });
-const app = await startDesktop({
+const app = await startConfiguredDesktop({
   root,
   port: 0,
   controllerFactory: options => {

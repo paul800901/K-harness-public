@@ -1,0 +1,17 @@
+.component-picker fieldset { border: 0; margin: 18px 0; padding: 0; min-width: 0; }
+.component-picker legend, .component-next h3 { margin: 0; padding: 0; font-size: var(--k-text-md); font-weight: 700; }
+.component-picker .modal-body p { margin: 4px 0 9px; font-size: var(--k-text-sm); line-height: 1.6; color: var(--k-ink-2); }
+.component-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+.component-grid label { display: flex; gap: 10px; align-items: flex-start; min-height: 44px; border: 1px solid var(--k-line-strong); border-radius: var(--k-radius-sm); padding: 10px; background: var(--k-raised); cursor: pointer; }
+.component-grid label:has(:checked) { border-color: var(--k-ink); box-shadow: inset 0 0 0 1px var(--k-ink); background: var(--k-selected); }
+.component-grid label:has(:focus-visible) { outline: 2px solid var(--k-brass-line); outline-offset: 2px; }
+.component-grid input { flex: none; margin: 3px 0 0; }
+.component-grid span { min-width: 0; overflow-wrap: anywhere; }
+.component-grid strong, .component-grid small { display: block; }
+.component-grid strong { font-size: var(--k-text-md); }
+.component-grid small { margin-top: 3px; font-size: var(--k-text-xs); line-height: 1.5; color: var(--k-ink-3); }
+.component-picker .modal-body .modal-actions { position: sticky; bottom: -5px; margin: 10px 0 0; padding: 10px 0; background: var(--k-raised); border-top: 1px solid var(--k-line); }
+.component-picker .modal-actions span { margin-inline-end: auto; font-size: var(--k-text-sm); }
+.component-next { overflow-wrap: anywhere; padding: 10px 0; border-bottom: 1px solid var(--k-line); }
+.component-next button { border: 1px solid var(--k-line-strong); }
+@media (max-width: 619px) { .component-grid { grid-template-columns: 1fr; } }

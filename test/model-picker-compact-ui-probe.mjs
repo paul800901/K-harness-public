@@ -605,7 +605,9 @@ try {
   state.usage.gemini.status = 'stale';
   await page.evaluate(s => window.__fakeState(s), state);
   // Stale Gemini quota is labelled as awaiting a query rather than shown as usable old numbers.
-  assert.match(await page.locator('.usage-row').filter({hasText: 'Gemini'}).textContent(), /目前額度待查詢/);
+  const staleGemini = page.locator('.usage-row').filter({hasText: 'Gemini'});
+  await staleGemini.getByText('目前額度待查詢', {exact: true}).waitFor();
+  assert.doesNotMatch(await staleGemini.textContent(), /97%/);
   await page.getByRole('button', {name: '查看額度與用量詳情', exact: true}).click();
   assert.doesNotMatch(await usage.textContent(), /每週\s*97%/);
   assert.match(await usage.textContent(), /上次回報/);

@@ -49,7 +49,7 @@ export async function ensureDshHome(home) {
 }
 
 export function dshEnvironment(source = process.env, home, {accessMode = 'workspace-write', apiKey} = {}) {
-  if (!apiKey) throw Error('尚未設定 DeepSeek API 金鑰：請在設定頁「討論 API」新增 DeepSeek（https://api.deepseek.com）連線。');
+  if (!apiKey) throw Error('尚未設定 DeepSeek API 金鑰：請在設定頁「API 連線」新增 DeepSeek（https://api.deepseek.com）連線。');
   const env = {...source};
   // Only K's own values reach the core: no inherited key, home, permission mode or K paths.
   for (const key of Object.keys(env))

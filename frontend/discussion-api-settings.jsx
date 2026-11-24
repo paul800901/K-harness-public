@@ -3,6 +3,7 @@ import './discussion-api-settings.css';
 
 const API_PRESETS = [
   {id: 'deepseek', name: 'DeepSeek', label: 'DeepSeek', baseUrl: 'https://api.deepseek.com'},
+  {id: 'gemini-live', name: 'Gemini Live', label: 'Gemini Live（艾瑪）', baseUrl: 'https://generativelanguage.googleapis.com/v1beta/openai'},
   {id: 'glm', name: 'GLM', label: 'GLM（Z.ai）', baseUrl: 'https://api.z.ai/api/paas/v4'},
   {id: 'kimi', name: 'Kimi', label: 'Kimi', baseUrl: 'https://api.moonshot.cn/v1'}
 ];
@@ -33,7 +34,7 @@ export function DiscussionApiSettings({request, disabled = false}) {
       const result = await request('discussion/connections');
       setConnections(Array.isArray(result?.connections) ? result.connections : []);
     } catch (error) {
-      setNotice(error.message || '目前無法讀取討論用 API 連線。');
+      setNotice(error.message || '目前無法讀取API 連線。');
     } finally {
       setLoading(false);
     }
@@ -101,7 +102,7 @@ export function DiscussionApiSettings({request, disabled = false}) {
         setForm(EMPTY_FORM);
         setEditing(false);
         await readConnections();
-        setNotice('討論用 API 連線已保存。');
+        setNotice('API 連線已保存。');
       } else if (action === 'models') {
         const result = await request('discussion/connections/models', {id: connection.id});
         const updated = result?.connection;
@@ -124,7 +125,7 @@ export function DiscussionApiSettings({request, disabled = false}) {
       }
       window.dispatchEvent(new Event('k-discussion-api-refresh'));
     } catch (error) {
-      setNotice(error.message || '無法更新討論用 API 連線。');
+      setNotice(error.message || '無法更新API 連線。');
     } finally {
       setBusy('');
     }
@@ -132,11 +133,11 @@ export function DiscussionApiSettings({request, disabled = false}) {
   if (disabled)
     return (
       <section className="discussion-api-settings">
-        <p>討論用 API 連線請在電腦端設定。</p>
+        <p>API 連線請在電腦端設定。</p>
       </section>
     );
   return (
-    <section className="discussion-api-settings" aria-label="討論用 API 連線">
+    <section className="discussion-api-settings" aria-label="API 連線">
       <details className="attachment-help discussion-api-help">
         <summary>API 連線說明</summary>
         <p className="discussion-api-intro">
@@ -149,7 +150,7 @@ export function DiscussionApiSettings({request, disabled = false}) {
           會一併影響 DeepSeek 核心。
         </p>
         <p className="discussion-api-intro">
-          可直接選擇 DeepSeek、GLM（Z.ai）或 Kimi，也可自訂 OpenAI 相容 API；此處不設定 Anthropic 或 Gemini API。
+          DeepSeek 核心、艾瑪和 API 諮詢模型共用這裡的金鑰設定，依各家 API 計費。艾瑪只能保留一組 Gemini Live 連線。
         </p>
         <p className="discussion-api-intro">網頁搜尋查詢與讀取網址會送至 Exa；免搜尋 Key，但有流量限制。</p>
       </details>
@@ -162,7 +163,7 @@ export function DiscussionApiSettings({request, disabled = false}) {
         </button>
       </div>
       {loading && <small role="status">正在讀取連線…</small>}
-      {!loading && !connections.length && <small>尚未設定討論用 API 連線。</small>}
+      {!loading && !connections.length && <small>尚未設定API 連線。</small>}
       {!!connections.length && (
         <div className="discussion-api-list">
           {connections.map(connection => (

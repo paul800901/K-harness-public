@@ -23,10 +23,11 @@ const PHASE = {
 };
 
 // One call at a time for the whole page; hanging up (or leaving the page) ends it for good.
-export function useVoiceCall() {
+export function useVoiceCall(enabled = true) {
   const [view, setView] = useState(null);
   const [configured, setConfigured] = useState(null);
   useEffect(() => {
+    if (!enabled) return;
     let generation = 0;
     const refresh = async () => {
       const current = ++generation;
@@ -45,7 +46,7 @@ export function useVoiceCall() {
       window.removeEventListener('k-discussion-api-refresh', refresh);
       window.removeEventListener('focus', refresh);
     };
-  }, []);
+  }, [enabled]);
   // Only the call in the slot may update the view; a late result from an earlier call is dropped.
   const [slot] = useState(() => callSlot(setView));
   useEffect(() => () => slot.hangUp(), [slot]);
@@ -78,7 +79,7 @@ export function CallButton({call, online}) {
           : call.active
             ? '通話中，按這裡掛斷'
             : call.configured === false
-              ? '語音秘書尚未設定。請在電腦的「設定 → 討論用 API 連線」設定自己的 Gemini Live 金鑰。'
+              ? '語音秘書尚未設定。請在電腦的「設定 → API 連線」設定自己的 Gemini Live 金鑰。'
               : `打電話給${SECRETARY_NAME}（K 語音秘書）。首次使用請在設定連接自己的 Gemini Live 金鑰。`
       }
       onClick={() => (call.active ? call.hangUp() : call.start())}

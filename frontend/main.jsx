@@ -1,3 +1,6 @@
+import {ComponentPicker, componentNames} from './component-picker.jsx';
+import {ComponentContext, useComponentEnabled} from './component-context.jsx';
+import {roomComponentOf, selectionAllows, visibleProviders} from '../shared/components.mjs';
 import {DiscussionRoundtable} from './discussion-roundtable.jsx';
 import {DiscussionControls, useDiscussionConfig} from './discussion-controls.jsx';
 import {useSidebarPreferences} from './sidebar-preferences.jsx';
@@ -163,7 +166,8 @@ const ChatView = React.memo(function ChatView({
   blocked,
   online,
   connecting,
-  loginRequired
+  loginRequired,
+  onComponents
 }) {
   const fileInput = useRef();
   const threadId = state.threadId;
@@ -352,7 +356,7 @@ const ChatView = React.memo(function ChatView({
         : await threadApi('send', {
             ...payload,
             // Armed discussion settings ride with the message; the main model starts the discussion when asked.
-            ...(discussionConfig.mode !== 'normal'
+            ...(discussionEnabled && discussionConfig.mode !== 'normal'
               ? {
                   discussion: {
                     mode: discussionConfig.mode,
@@ -441,6 +445,8 @@ const ChatView = React.memo(function ChatView({
       setDraftText('');
     }
   };
+  const enabled = useComponentEnabled();
+  const discussionEnabled = ['codex','claude','gemini','api'].some(enabled);
   const voice = useVoiceComposer({
     disabled: blocked || !state.threadId || ['connecting', 'offline', 'error', 'uncertain'].includes(state.status),
     sessionKey: threadId,
@@ -583,12 +589,25 @@ const ChatView = React.memo(function ChatView({
                   !state.messages?.length && (
                     <div className="empty-state">
                       <img className="big-k" src={kLogo} alt="K 執行中樞" width="64" height="64" />
-                      <h1>{state.threadId ? '這次要完成什麼工作？' : '你的工作，從這裡繼續。'}</h1>
+                      <h1>
+                        {state.threadId
+                          ? '這次要完成什麼工作？'
+                          : visibleProviders(enabled).length
+                            ? '你的工作，從這裡繼續。'
+                            : '先選一個 AI。'}
+                      </h1>
                       <p>
                         {state.threadId
                           ? '可以拖入檔案、貼上圖片，或直接描述要交付的結果。'
-                          : '從左側選擇對話，或建立一個新對話。'}
+                          : visibleProviders(enabled).length
+                            ? '從左側選擇對話，或建立一個新對話。'
+                            : '選好後就能建立聊天室。'}
                       </p>
+                      {!state.threadId && !visibleProviders(enabled).length && (
+                        <button type="button" className="primary" onClick={onComponents}>
+                          選擇元件
+                        </button>
+                      )}
                     </div>
                   )
                 )}
@@ -627,15 +646,17 @@ const ChatView = React.memo(function ChatView({
             />
           )}
           <div className="composer-area">
-            <DiscussionControls
+            {(discussionEnabled || state.discussion?.busy) && <DiscussionControls
               state={state}
               models={discussionModels}
               config={discussionConfig}
               onChange={setDiscussionConfig}
-              loadModels={() => api('models')}
+              loadModels={() =>
+                api(state.threadId ? `models?threadId=${encodeURIComponent(state.threadId)}` : 'models')
+              }
               onCatalog={discussionCatalog}
               disabled={blocked || !state.threadId || (state.busy && !state.discussion?.busy)}
-            />
+            />}
             <WorkProgress plan={state.progress?.plan} />
             {!!state.questions?.length && (
               <div className="inline-requests" aria-label="需要你的確認">
@@ -923,7 +944,7 @@ const ChatView = React.memo(function ChatView({
                       </>
                     ) : (
                       <>
-                        <button
+                        {enabled('dictation') && <button
                           type="button"
                           className="voice-button"
                           aria-label="開始聽寫"
@@ -937,7 +958,7 @@ const ChatView = React.memo(function ChatView({
                           onClick={startComposerVoice}
                         >
                           <Mic size={18} />
-                        </button>
+                        </button>}
                         {state.busy ? (
                           draftText.trim() || responseQuotes.length || uploads.some(a => a.id) ? (
                             <button
@@ -1043,14 +1064,22 @@ function App() {
     [panelTabsByThread, setPanelTabsByThread] = useState(() => ({['']: ['artifacts']})),
     [browserInfo, setBrowserInfo] = useState(null),
     [modal, setModal] = useState(null),
+    promptedComponents = useRef(false),
     [page, setPage] = useState('chat'),
-    voiceCall = useVoiceCall(),
+    // Every reconnect snapshot carries a new but usually equal array.
+    enabled = useMemo(() => selectionAllows(receivedState.components), [JSON.stringify(receivedState.components)]),
+    voiceCall = useVoiceCall(online && enabled('emma')),
     [models, setModels] = useState([]),
     [uploadsByThread, setUploadsByThread] = useState({}),
     [effort, setEffort] = useState(''),
     [accessMode, setAccessMode] = useState('workspace-write'),
     [theme, setTheme] = useState(() => readTheme()),
     [panelWidth, setPanelWidth] = useState(null);
+  useEffect(() => {
+    if (!online || receivedState.components !== null || promptedComponents.current) return;
+    promptedComponents.current = true;
+    setModal({type: 'components', firstRun: true});
+  }, [online, receivedState.components]);
   // A call opens the secretary room, where the conversation shows up as text while it goes on.
   const call = {
     ...voiceCall,
@@ -1094,6 +1123,19 @@ function App() {
     )
       setNavigationTarget(null);
   }, [navigationTarget, receivedState.threadId, receivedState.connectionOpening]);
+  useEffect(() => {
+    setModels([]);
+    if (!enabled('browser')) setPanel(p => (p.startsWith('browser:') ? 'artifacts' : p));
+  }, [enabled]);
+  const emmaVisible = enabled('emma') || voiceCall.active;
+  useEffect(() => {
+    if (!emmaVisible) setPage(p => (p === 'secretary' ? 'chat' : p));
+  }, [emmaVisible]);
+  // A room keeps its own core listed even after that AI is deselected.
+  const loadRoomModels = () =>
+    api(state.threadId ? `models?threadId=${encodeURIComponent(state.threadId)}` : 'models');
+  const chooseComponents = () => setModal({type: 'components', firstRun: receivedState.components === null});
+  const roomComponent = state.threadId && !state.connectionOpening ? roomComponentOf(state, enabled) : null;
   const groups = useMemo(() => {
     const list = groupConversationMessages(state.messages);
     return new Map(list.flatMap(group => group.messages.map(message => [message.id, group])));
@@ -1160,7 +1202,7 @@ function App() {
   const hasNativeDiffs =
     !!state.turnDiffs?.length || (state.tools ?? []).some(tool => tool.patchChanges?.length || tool.hasPatchChanges);
   const activePanelThread = state.threadId ?? '',
-    panelTabs = panelTabsByThread[activePanelThread] ?? ['artifacts'];
+    panelTabs = (panelTabsByThread[activePanelThread] ?? ['artifacts']).filter(id => enabled('browser') || !id.startsWith('browser:'));
   const workerPanelRows = [
     ...(state.workers ?? []).filter(row => !row.conversationId || row.conversationId === state.threadId)
   ];
@@ -1638,6 +1680,10 @@ function App() {
     [state.threadId]
   );
   const createInProject = path => {
+    if (!visibleProviders(enabled).length) {
+      chooseComponents();
+      return;
+    }
     const visible = projects.filter(p => !p.archived),
       selected = visible.find(p => sameWorkspace(p.path, path ?? state.workspace)) ?? visible[0];
     if (!selected) {
@@ -1918,6 +1964,7 @@ function App() {
   const previewName =
     modal?.type === 'preview' ? (modal.route === 'message-file' ? readableDestination(modal.name) : modal.name) : '';
   return (
+    <ComponentContext.Provider value={enabled}>
     <TranscriptContext.Provider value={transcript}>
       <AppContext.Provider
         value={{state, preview, modelName, models, setModels, error, branch: startBranch, groups, lastAssistantId}}
@@ -1957,7 +2004,7 @@ function App() {
               <button className="new-chat" onClick={() => createInProject()} disabled={disabled}>
                 <Plus size={18} /> 新對話
               </button>
-              <button
+              {enabled('emma') && <button
                 className={`sidebar-secretary-button${page === 'secretary' ? ' selected' : ''}`}
                 onClick={() => {
                   setPage('secretary');
@@ -1966,7 +2013,7 @@ function App() {
                 }}
               >
                 <Headphones size={18} /> 秘書室
-              </button>
+              </button>}
               <button
                 className={`sidebar-schedule-button${page === 'schedules' ? ' selected' : ''}`}
                 onClick={() => {
@@ -2074,13 +2121,13 @@ function App() {
               onProjectMetadata={updateProjectMetadata}
             />
             <div className="sidebar-bottom">
-              <Usage state={state} online={online} onDetails={() => setModal({type: 'usage'})} />
+              {['codex','claude','gemini','grok','deepseek','emma'].some(enabled) && <Usage state={state} online={online} onDetails={() => setModal({type: 'usage'})} />}
               <div className="sidebar-settings-row">
                 <button title="設定" onClick={() => setModal({type: 'settings'})}>
                   <Settings size={18} /> 設定
                 </button>
                 {/* Only inside the phone app (android/): ask it to check for a newer app now. */}
-                {typeof window.KApp?.checkUpdate === 'function' && (
+                {enabled('android') && typeof window.KApp?.checkUpdate === 'function' && (
                   <button title="檢查手機 K App 有沒有新版" onClick={() => window.KApp.checkUpdate()}>
                     <RefreshCw size={18} /> App 更新
                   </button>
@@ -2111,7 +2158,7 @@ function App() {
                 setInspector={setInspector}
               />
             )}
-            {page === 'secretary' && (
+            {emmaVisible && page === 'secretary' && (
               <SecretaryPage
                 voiceRevision={state.voiceRevision}
                 sessions={sessions}
@@ -2168,7 +2215,7 @@ function App() {
                 </div>
               </div>
               <div className="header-actions">
-                <CallButton call={call} online={online} />
+                {emmaVisible && <CallButton call={call} online={online} />}
                 <div className="header-status">
                   {remoteClient && (
                     <span className={`remote-connection ${online ? 'connected' : ''}`} role="status">
@@ -2211,7 +2258,7 @@ function App() {
                       <WorkerActivityPopover
                         state={state}
                         models={models}
-                        loadModels={() => api('models')}
+                        loadModels={loadRoomModels}
                         onCatalog={setModels}
                         online={online}
                         onViewDetails={() => {
@@ -2219,7 +2266,7 @@ function App() {
                           chooseInspector(true);
                         }}
                       />
-                      {state.colabBalance && <ColabBalancePopover balance={state.colabBalance} online={online} />}
+                      {enabled('colab') && state.colabBalance && <ColabBalancePopover balance={state.colabBalance} online={online} />}
                       {!mobile && (
                         <WorkStatus
                           state={state}
@@ -2280,6 +2327,14 @@ function App() {
                 <button onClick={() => setNotice('')}>知道了</button>
               </div>
             )}
+            {roomComponent && (
+              <div className="notice" role="status">
+                這個聊天室使用 {componentNames[roomComponent]}，目前未選為元件。仍可繼續使用。
+                <button type="button" onClick={chooseComponents}>
+                  更改元件
+                </button>
+              </div>
+            )}
             <NativeNotices state={state} error={error || state.error} />
             {state.workerConnection === 'failed' && (
               <div className="notice" role="status">
@@ -2296,6 +2351,7 @@ function App() {
               key={state.threadId || 'empty'}
               blocked={busy || busyRooms.has(state.threadId) || !online}
               onChooseModel={() => setModal({type: 'model', threadId: state.threadId})}
+              onComponents={chooseComponents}
               modelLabel={modelName(state.model)}
               modelButtonLabel={modelButtonLabel(state.model)}
               {...{
@@ -2422,7 +2478,7 @@ function App() {
                     className="panel-add-menu anchored-popover"
                     role="menu"
                   >
-                    {!panelTabs.includes('roundtable') && (
+                    {['codex','claude','gemini','api'].some(enabled) && !panelTabs.includes('roundtable') && (
                       <button role="menuitem" onClick={() => openPanel('roundtable')}>
                         圓桌
                       </button>
@@ -2432,7 +2488,7 @@ function App() {
                         子代理
                       </button>
                     )}
-                    {!panelTabs.some(id => id.startsWith('browser:')) && (
+                    {enabled('browser') && !panelTabs.some(id => id.startsWith('browser:')) && (
                       <button role="menuitem" onClick={addBrowserPanel}>
                         瀏覽器
                       </button>
@@ -2615,6 +2671,8 @@ function App() {
                 </select>
               </label>
               <ModelPicker
+                key={receivedState.components?.join(',')}
+                onSettings={() => setModal({type: 'settings'})}
                 currentModel={state.model}
                 disabled={disabled}
                 loadModels={() => api('models')}
@@ -2773,7 +2831,7 @@ function App() {
                 currentEffort={state.effort}
                 hasHistory={state.messages?.some(m => m.role === 'user')}
                 disabled={disabled}
-                loadModels={() => api('models')}
+                loadModels={loadRoomModels}
                 onCatalog={setModels}
                 onClose={() => setModal(null)}
                 onCreate={selection =>
@@ -2893,6 +2951,11 @@ function App() {
               </div>
             </Modal>
           )}
+          {modal?.type === 'components' && (
+            <ComponentPicker selection={receivedState.components} firstRun={modal.firstRun} readError={receivedState.componentsError}
+              onSaved={components => {setState(current => ({...current, components})); setModels([]);}}
+              onClose={() => setModal(null)} onSettings={() => setModal({type: 'settings'})} />
+          )}
           {modal?.type === 'settings' && (
             <SettingsDialog
               disabled={disabled}
@@ -2904,6 +2967,8 @@ function App() {
               onFollowUpMode={mode => action(() => api('follow-up-mode', {mode}))}
               mobile={mobile}
               archiveCount={archiveCount}
+              components={receivedState.components}
+              onComponents={chooseComponents}
               onUsage={() => setModal({type: 'usage'})}
               onArchive={() => {
                 setArchiveMessage('');
@@ -2928,6 +2993,7 @@ function App() {
         </div>
       </AppContext.Provider>
     </TranscriptContext.Provider>
+    </ComponentContext.Provider>
   );
 }
 class ErrorBoundary extends React.Component {

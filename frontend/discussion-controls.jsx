@@ -1,3 +1,4 @@
+import {useComponentEnabled} from './component-context.jsx';
 import React, {useState, useEffect, useMemo} from 'react';
 import {discussionModes} from '../shared/discussion.mjs';
 import {discussionPresentation} from './discussion-roundtable-data.mjs';
@@ -14,22 +15,23 @@ export function useDiscussionConfig(threadId, discussionId) {
       return {mode: 'normal', participants: [], includeContext: true};
     }
   };
-  const [saved, setConfig] = useState(read);
+  const [stored, setStored] = useState(() => ({key, value: read()}));
+  const saved = stored.key === key ? stored.value : read();
+  if (stored.key !== key) setStored({key, value: saved});
   // A new run consumes the armed settings. Its live controls still use discussion.mode;
   // the next ordinary turn must not carry the previous run's settings, even after a reload.
   const config =
     discussionId && saved.runId !== discussionId
       ? {...saved, mode: 'normal', target: undefined, runId: discussionId}
       : saved;
-  useEffect(() => setConfig(read()), [threadId]);
   useEffect(() => {
     if (config === saved) return;
-    setConfig(config);
+    setStored({key, value: config});
     sessionStorage.setItem(key, JSON.stringify(config));
   }, [config, saved, key]);
   const update = next => {
     const value = {...next, runId: discussionId ?? next.runId};
-    setConfig(value);
+    setStored({key, value});
     sessionStorage.setItem(key, JSON.stringify(value));
   };
   return [config, update];
@@ -38,6 +40,7 @@ export function useDiscussionConfig(threadId, discussionId) {
 export function DiscussionControls({state, models = [], config, onChange, loadModels, onCatalog, disabled}) {
   const [expanded, setExpanded] = useState(false);
   const [catalogError, setCatalogError] = useState('');
+  const enabled = useComponentEnabled();
   const [apiModels, setApiModels] = useState([]),
     [apiCatalogError, setApiCatalogError] = useState('');
   const d = state.discussion,
@@ -47,7 +50,7 @@ export function DiscussionControls({state, models = [], config, onChange, loadMo
     if (running) setExpanded(false);
   }, [running]);
   const available = models.filter(
-    m => m.available !== false && m.hidden !== true && !['gemma', 'grok', 'deepseek'].includes(modelProvider(m.model))
+    m => enabled(modelProvider(m.model)) && m.available !== false && m.hidden !== true && !['gemma', 'grok', 'deepseek'].includes(modelProvider(m.model))
   );
   const defaults = [
     available.some(m => m.model === state.model)
@@ -82,12 +85,12 @@ export function DiscussionControls({state, models = [], config, onChange, loadMo
     }
   };
   useEffect(() => {
-    if (!expanded) return;
+    if (!expanded || !enabled('api')) {setApiModels([]); return;}
     void readApiModels();
     const refresh = () => void readApiModels();
     window.addEventListener('k-discussion-api-refresh', refresh);
     return () => window.removeEventListener('k-discussion-api-refresh', refresh);
-  }, [expanded]);
+  }, [expanded, enabled]);
   useEffect(() => {
     if (config.mode === 'normal' || models.length || !loadModels) return;
     let present = true;

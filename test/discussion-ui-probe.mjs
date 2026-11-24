@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import {mkdir, mkdtemp, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {launchProbeBrowser, probeEvidenceDir} from './ui-probe.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 import {createConversationController} from '../src/conversation-controller.mjs';
 import {saveMainSession} from '../src/main-sessions.mjs';
 
@@ -148,7 +148,7 @@ const login = () => ({
 });
 let browser, app;
 try {
-  app = await startDesktop({
+  app = await startConfiguredDesktop({
     root,
     port: 0,
     controllerFactory: opts =>
@@ -213,7 +213,7 @@ try {
   await page.screenshot({path: path.join(out, 'discussion-desktop.png')});
   await mode.selectOption('review');
   await page.reload();
-  await mode.waitFor();
+  await page.locator('.discussion-toolbar small').waitFor();
   assert.equal(await mode.inputValue(), 'review', 'reselecting after the same completed run survives reload');
   nextBrief = '要審查的指定方案：首頁建議全文。';
   await page.getByLabel('工作訊息', {exact: true}).fill('請審查指定方案');
@@ -232,7 +232,7 @@ try {
     {id: a.threadId, saved}
   );
   await page.reload();
-  await mode.waitFor();
+  await page.locator('.discussion-toolbar small').waitFor();
   assert.equal(await mode.inputValue(), 'normal', 'a different completed run consumes stale saved settings');
   assert.equal(
     await page.evaluate(id => JSON.parse(sessionStorage.getItem(`k-discussion:${id}`)).target, a.threadId),

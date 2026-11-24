@@ -1,3 +1,4 @@
+import {createComponentPreferences} from './component-preferences.mjs';
 import http from 'node:http';
 import path from 'node:path';
 import {createReadStream} from 'node:fs';
@@ -59,6 +60,8 @@ export async function startDesktop({
   maxBehindMs = 15000
 }) {
   const sidebarPreferences = await createSidebarPreferences(root);
+  const components = await createComponentPreferences(root);
+  const componentEnabled = id => components.value?.includes(id) === true;
   const followUp = await createFollowUpPreference(root);
   const remoteFile = path.join(root, '.local', 'remote-access.json'),
     androidShellDir = path.join(root, '.local', 'android-shell');
@@ -170,6 +173,8 @@ export async function startDesktop({
     const state = {
       ...controller.state,
       dictationConfigured: localDictation.configured === true,
+      components: components.value,
+      componentsError: components.error,
       followUpMode: followUp.mode,
       sidebarPreferences: sidebarPreferences.value,
       sidebarPreferencesError: sidebarPreferences.error,
@@ -215,6 +220,7 @@ export async function startDesktop({
     broadcast(stateStream.update(state, controller.historyVersion));
   };
   const controller = controllerFactory({
+    componentEnabled,
     root,
     executable,
     ...(!geminiAccounts && {officialGeminiAccount}),
@@ -552,7 +558,7 @@ export async function startDesktop({
       }
       if (req.method === 'GET' && url.pathname === '/api/codex/auth') return json(200, await codexLogin.status());
       if (req.method === 'GET' && url.pathname === '/api/discussion/models')
-        return json(200, discussionApi ? await discussionApi.models() : {models: []});
+        return json(200, discussionApi && componentEnabled('api') ? await discussionApi.models() : {models: []});
       if (req.method === 'GET' && url.pathname === '/api/discussion/connections')
         return json(200, discussionApi ? await discussionApi.list() : {connections: []});
       if (req.method === 'GET' && url.pathname === '/api/gemini/accounts')
@@ -597,7 +603,7 @@ export async function startDesktop({
       if (req.method === 'GET' && url.pathname === '/api/sessions') return json(200, await controller.sessions());
       if (req.method === 'GET' && url.pathname === '/api/projects')
         return json(200, await listProjects(root, (await controller.sessions()).sessions));
-      if (req.method === 'GET' && url.pathname === '/api/models') return json(200, await controller.models());
+      if (req.method === 'GET' && url.pathname === '/api/models') return json(200, await controller.models(url.searchParams.get('threadId')));
       if (req.method === 'GET' && ['/api/tool', '/api/turn-diff'].includes(url.pathname)) {
         const state = controller.state;
         if (!state.threadId || url.searchParams.get('threadId') !== state.threadId)
@@ -757,7 +763,7 @@ export async function startDesktop({
         return json(200, await colabBalance.refresh());
       }
       if (url.pathname.startsWith('/api/discussion/connections/')) {
-        if (!discussionApi) throw Error('此版本未接通討論 API 設定。');
+        if (!discussionApi) throw Error('此版本未接通 API 連線設定。');
         const operation = {
           '/api/discussion/connections/save': 'save',
           '/api/discussion/connections/models': 'discover',
@@ -983,6 +989,11 @@ export async function startDesktop({
         const preferences = await sidebarPreferences.update(data);
         publish();
         return json(200, {preferences});
+      }
+      if (url.pathname === '/api/components') {
+        const selection = await components.set(data.components);
+        publish();
+        return json(200, {components: selection});
       }
       if (url.pathname === '/api/follow-up-mode') {
         const followUpMode = await followUp.set(data.mode);

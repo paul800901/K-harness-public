@@ -70,6 +70,7 @@ export function createAcpController(
     openAgent = profile.openAgent,
     loginFactory = profile.loginFactory,
     onChange = () => {},
+    componentEnabled = () => true,
     browserConfig = async () => null,
     closeBrowser = async () => {},
     bridgeFactory = null,
@@ -509,6 +510,7 @@ export function createAcpController(
         models: (await workerCatalog()).models,
         geminiGateway: true,
         claudeGateway: true,
+        componentEnabled,
         provider
       }).developer_instructions;
     const parent = state.threadId,
@@ -684,7 +686,7 @@ export function createAcpController(
           }
         : {}),
       // Read-only Colab entry (sign-in and eligibility; no runtime or inference).
-      ...(colabAdmin
+      ...(colabAdmin && componentEnabled('colab')
         ? {
             colab: {
               status: args => {
@@ -1038,7 +1040,7 @@ export function createAcpController(
             });
       browserMode = state.accessMode;
     }
-    const desktop = await desktopControlMcp({root, fullAccess: state.accessMode === 'danger-full-access'});
+    const desktop = componentEnabled('desktop') && await desktopControlMcp({root, fullAccess: state.accessMode === 'danger-full-access'});
     mcpServers = [
       ...(lunaServer ? [httpServer('k_luna', lunaServer)] : []),
       ...(browserServer ? [httpServer('k_browser', browserServer)] : []),

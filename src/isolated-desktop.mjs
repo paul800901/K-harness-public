@@ -110,10 +110,14 @@ export async function startIsolatedDesktop({
         return false;
       }
     });
-    if (!row) throw Error('尚未設定 DeepSeek API 金鑰：請在設定頁「討論 API」新增 DeepSeek（https://api.deepseek.com）連線。');
+    if (!row) throw Error('尚未設定 DeepSeek API 金鑰：請在設定頁「API 連線」新增 DeepSeek（https://api.deepseek.com）連線。');
     return (await discussionApi.credentials(row.id)).key;
   };
   const deepseekLogin = createDeepSeekLogin({cwd: stateRoot, env, apiKey: deepseekKey});
+  const workerComponents = options => ({
+    componentEnabled: options.componentEnabled,
+    browserSession: () => options.componentEnabled?.('browser') === false ? null : browsers.session()
+  });
   const controllerFactory = options =>
     (conversationController = restrictMove(
       createConversationController({
@@ -143,16 +147,17 @@ export async function startIsolatedDesktop({
                 current = createGeminiController({
                   ...opts,
                   env,
-                  browserConfig: browser.config,
+                  browserConfig: params => (options.componentEnabled?.('browser') === false ? null : browser.config(params)),
                   closeBrowser: browser.close,
                   bridgeFactory: params =>
                     createLunaBridge({
                       ...params,
+                      componentEnabled: options.componentEnabled,
                       executable,
                       hostFactory: lunaHostFactory,
                       claudeOptions: {env, commandSpec},
                       apiOptions: {connections: discussionApi},
-                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, browserSession: browsers.session},
+                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, ...workerComponents(options)},
                       grokOptions: {env},
                       deepseekOptions: {env, apiKey: deepseekKey}
                     })
@@ -173,16 +178,17 @@ export async function startIsolatedDesktop({
                   ...opts,
                   env,
                   loginFactory: () => grokLogin,
-                  browserConfig: browser.config,
+                  browserConfig: params => (options.componentEnabled?.('browser') === false ? null : browser.config(params)),
                   closeBrowser: browser.close,
                   bridgeFactory: params =>
                     createLunaBridge({
                       ...params,
+                      componentEnabled: options.componentEnabled,
                       executable,
                       hostFactory: lunaHostFactory,
                       claudeOptions: {env, commandSpec},
                       apiOptions: {connections: discussionApi},
-                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, browserSession: browsers.session},
+                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, ...workerComponents(options)},
                       grokOptions: {env},
                       deepseekOptions: {env, apiKey: deepseekKey}
                     })
@@ -204,16 +210,17 @@ export async function startIsolatedDesktop({
                   env,
                   apiKey: deepseekKey,
                   loginFactory: () => deepseekLogin,
-                  browserConfig: browser.config,
+                  browserConfig: params => (options.componentEnabled?.('browser') === false ? null : browser.config(params)),
                   closeBrowser: browser.close,
                   bridgeFactory: params =>
                     createLunaBridge({
                       ...params,
+                      componentEnabled: options.componentEnabled,
                       executable,
                       hostFactory: lunaHostFactory,
                       claudeOptions: {env, commandSpec},
                       apiOptions: {connections: discussionApi},
-                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, browserSession: browsers.session},
+                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, ...workerComponents(options)},
                       grokOptions: {env},
                       deepseekOptions: {env, apiKey: deepseekKey}
                     })
@@ -249,16 +256,17 @@ export async function startIsolatedDesktop({
                   bridgeFactory: params =>
                     createLunaBridge({
                       ...params,
+                      componentEnabled: options.componentEnabled,
                       ...(opts.selfHosted
                         ? {hostFactory: hostOptions => codexHost(hostOptions, current.state.workspace)}
                         : {}),
                       claudeOptions: {env, commandSpec},
                       apiOptions: {connections: discussionApi},
-                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, browserSession: browsers.session},
+                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, ...workerComponents(options)},
                       grokOptions: {env},
                       deepseekOptions: {env, apiKey: deepseekKey}
                     }),
-                  browserConfig: browser.config,
+                  browserConfig: params => (options.componentEnabled?.('browser') === false ? null : browser.config(params)),
                   closeBrowser: browser.close,
                   browserRequest: browsers.request
                 });
@@ -277,16 +285,17 @@ export async function startIsolatedDesktop({
                   ...opts,
                   commandSpec,
                   hostFactory,
-                  browserConfig: browser.config,
+                  browserConfig: params => (options.componentEnabled?.('browser') === false ? null : browser.config(params)),
                   closeBrowser: browser.close,
                   bridgeFactory: params =>
                     createLunaBridge({
                       ...params,
+                      componentEnabled: options.componentEnabled,
                       executable,
                       hostFactory: lunaHostFactory,
                       claudeOptions: {env, commandSpec},
                       apiOptions: {connections: discussionApi},
-                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, browserSession: browsers.session},
+                      geminiOptions: {env, officialGeminiAccount: options.officialGeminiAccount, ...workerComponents(options)},
                       grokOptions: {env},
                       deepseekOptions: {env, apiKey: deepseekKey}
                     })

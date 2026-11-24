@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import {mkdir, mkdtemp, writeFile} from 'node:fs/promises';
 import path from 'node:path';
 import {launchProbeBrowser, probeEvidenceDir} from './ui-probe.mjs';
-import {startDesktop} from '../src/desktop-server.mjs';
+import {startConfiguredDesktop} from './configured-desktop.mjs';
 import {createConversationController} from '../src/conversation-controller.mjs';
 import {saveMainSession} from '../src/main-sessions.mjs';
 const out = probeEvidenceDir('quota-speaker-evidence');
@@ -134,7 +134,7 @@ const login = () => ({
 });
 let browser, app;
 try {
-  app = await startDesktop({
+  app = await startConfiguredDesktop({
     root,
     port: 0,
     controllerFactory: opts =>
