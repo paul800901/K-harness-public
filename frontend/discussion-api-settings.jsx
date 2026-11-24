@@ -34,7 +34,7 @@ export function DiscussionApiSettings({request, disabled = false}) {
       const result = await request('discussion/connections');
       setConnections(Array.isArray(result?.connections) ? result.connections : []);
     } catch (error) {
-      setNotice(error.message || '目前無法讀取API 連線。');
+      setNotice(error.message || '目前無法讀取 API 連線。');
     } finally {
       setLoading(false);
     }
@@ -125,7 +125,7 @@ export function DiscussionApiSettings({request, disabled = false}) {
       }
       window.dispatchEvent(new Event('k-discussion-api-refresh'));
     } catch (error) {
-      setNotice(error.message || '無法更新API 連線。');
+      setNotice(error.message || '無法更新 API 連線。');
     } finally {
       setBusy('');
     }
@@ -163,7 +163,7 @@ export function DiscussionApiSettings({request, disabled = false}) {
         </button>
       </div>
       {loading && <small role="status">正在讀取連線…</small>}
-      {!loading && !connections.length && <small>尚未設定API 連線。</small>}
+      {!loading && !connections.length && <small>尚未設定 API 連線。</small>}
       {!!connections.length && (
         <div className="discussion-api-list">
           {connections.map(connection => (

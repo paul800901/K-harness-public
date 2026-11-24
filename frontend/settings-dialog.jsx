@@ -53,7 +53,7 @@ export function SettingsDialog({
         {['codex', 'claude', 'gemini', 'grok'].some(enabled) && <AccountConnections defaultOpen disabled={disabled} />}
         {!remoteClient && [...nativeCores, 'gemma', 'colab'].some(enabled) && <CoreUpdates />}
         {!visibleProviders(enabled).length && <p className="modal-description">尚未選擇 AI。</p>}
-        {remoteClient && (
+        {remoteClient && (nativeCores.some(enabled) || enabled('emma')) && (
           <>
             <p className="modal-description">
               可在此登入、登出訂閱帳號；官方驗證請本人完成。更新核心及操作電腦視窗仍需在電腦進行。

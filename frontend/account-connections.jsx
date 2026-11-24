@@ -479,7 +479,7 @@ export function AccountConnections({
   useEffect(() => {
     onStatus?.({claude: claudeStatus, codex: codexStatus, gemini: geminiStatusForConsumers, grok: grokStatus});
   }, [claudeStatus, codexStatus, geminiStatusForConsumers, grokStatus, onStatus]);
-  if (hidden) return null;
+  if (hidden || !['codex', 'claude', 'gemini', 'grok'].some(enabled)) return null;
   return (
     <details
       className="provider-auth-status"

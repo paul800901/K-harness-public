@@ -855,6 +855,19 @@ try {
   await page.getByRole('button', {name: '連接 K', exact: true}).click();
   await page.getByText('已連線', {exact: true}).waitFor();
   assert.equal(calls.filter(c => c.op === 'send').length, beforeUnknown + 1);
+  const selectionResponse = await page.evaluate(async () => {
+    const response = await fetch('/api/components', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json', 'X-K-Request': '1', 'X-K-Command': crypto.randomUUID()},
+      body: JSON.stringify({components: ['remote']})
+    });
+    return response.status;
+  });
+  assert.equal(selectionResponse, 200);
+  await page.getByRole('button', {name: '展開側欄', exact: true}).click();
+  await page.getByRole('button', {name: '設定', exact: true}).click();
+  await settings.getByText('尚未選擇 AI。', {exact: true}).waitFor();
+  assert.equal(await settings.getByRole('button', {name: '查看／更新額度', exact: true}).count(), 0);
   assert.deepEqual(errors, []);
   await writeFile(
     path.join(out, 'ui-result.json'),

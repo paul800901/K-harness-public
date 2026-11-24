@@ -41,7 +41,7 @@ try {
   page.on('requestfailed', request => errors.push(`request failed: ${request.url()} ${request.failure()?.errorText}`));
   await page.goto(origin, {waitUntil: 'commit', timeout: 15000});
   try {
-    await page.getByText('尚未設定API 連線。').waitFor({timeout: 15000});
+    await page.getByText('尚未設定 API 連線。').waitFor({timeout: 15000});
   } catch (error) {
     const diagnostic = await page.evaluate(() => ({
       body: document.body.innerHTML,
@@ -150,7 +150,7 @@ try {
     const presetPage = await browser.newPage();
     await presetPage.route('**/favicon.ico', route => route.fulfill({status: 204, body: ''}));
     await presetPage.goto(origin);
-    await presetPage.getByText('尚未設定API 連線。').waitFor();
+    await presetPage.getByText('尚未設定 API 連線。').waitFor();
     await presetPage.getByRole('button', {name: '新增 API 連線', exact: true}).click();
     const form = presetPage.locator('.discussion-api-form'),
       providerField = form.locator('select'),

@@ -237,7 +237,11 @@ export function DiscussionControls({state, models = [], config, onChange, loadMo
                         ))}
                     </optgroup>
                   ))}
-                  {p.route === 'api' && !selected && <option value={currentChoice}>{p.model}（API 目錄未列出）</option>}
+                  {p.model && !selected && (
+                    <option disabled value={currentChoice}>
+                      {p.model}（{p.route === 'api' ? 'API 目錄未列出' : '目前無法選用'}）
+                    </option>
+                  )}
                 </select>
                 {!!efforts.length && (
                   <select

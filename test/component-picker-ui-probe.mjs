@@ -111,6 +111,16 @@ try {
   await edit.getByRole('checkbox', {name: '聽寫', exact: true}).check();
   await edit.getByRole('button', {name: '儲存'}).click();
   await desk.getByRole('button', {name: '開始聽寫', exact: true}).waitFor({state: 'attached'});
+  // A DeepSeek-only installation uses an API connection, with no subscription account rows.
+  await desk.getByRole('button', {name: '設定', exact: true}).click();
+  await settings.getByRole('button', {name: '更改元件'}).click();
+  await edit.getByRole('checkbox', {name: 'Gemini（Antigravity）'}).uncheck();
+  await edit.getByRole('checkbox', {name: 'DeepSeek Harness', exact: true}).check();
+  await edit.getByRole('button', {name: '儲存'}).click();
+  await desk.getByRole('button', {name: '新對話', exact: true}).click();
+  await create.locator('.model-provider-fixed').waitFor();
+  assert.match(await create.locator('.model-provider-fixed').innerText(), /DeepSeek/);
+  assert.equal(await create.locator('.provider-auth-status').count(), 0);
   assert.deepEqual(errors, []);
   console.log('First run, phone layout, dependency, persistent Gemini-only settings, quota and model picker verified.');
 } finally {

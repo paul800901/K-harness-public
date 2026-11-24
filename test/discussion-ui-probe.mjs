@@ -299,6 +299,17 @@ try {
   assert.deepEqual(errors, []);
   const sendBounds = await page.getByRole('button', {name: '送出訊息', exact: true}).boundingBox();
   assert(sendBounds.y + sendBounds.height <= 844, 'expanded mobile settings must leave the send control reachable');
+  const participant = page.getByLabel('參與模型 2', {exact: true});
+  await participant.selectOption('native:claude-opus-5-5');
+  const changed = await page.request.post(app.origin + '/api/components', {
+    headers: {'X-K-Request': '1', Origin: app.origin},
+    data: {components: ['codex', 'gemini']}
+  });
+  assert.equal(changed.status(), 200);
+  const inactive = participant.locator('option:checked');
+  await participant.locator('option:checked:disabled').waitFor({state: 'attached'});
+  assert.equal(await inactive.textContent(), 'claude-opus-5-5（目前無法選用）');
+  assert.equal(await inactive.isDisabled(), true);
   await writeFile(
     path.join(out, 'ui-result.json'),
     JSON.stringify(
