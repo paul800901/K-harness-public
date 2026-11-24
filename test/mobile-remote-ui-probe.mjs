@@ -866,8 +866,9 @@ try {
   assert.equal(selectionResponse, 200);
   await page.getByRole('button', {name: '展開側欄', exact: true}).click();
   await page.getByRole('button', {name: '設定', exact: true}).click();
-  await settings.getByText('尚未選擇 AI。', {exact: true}).waitFor();
-  assert.equal(await settings.getByRole('button', {name: '查看／更新額度', exact: true}).count(), 0);
+  const currentSettings = page.getByRole('dialog', {name: '設定', exact: true});
+  await currentSettings.getByText('尚未選擇 AI。', {exact: true}).waitFor();
+  assert.equal(await currentSettings.getByRole('button', {name: '查看／更新額度', exact: true}).count(), 0);
   assert.deepEqual(errors, []);
   await writeFile(
     path.join(out, 'ui-result.json'),
