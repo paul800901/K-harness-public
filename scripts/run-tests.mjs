@@ -7,7 +7,7 @@ import {testEnvironment} from './test-env.mjs';
 // The Windows installer runs the suite alongside the user's other applications.
 // Limit simultaneous native-process and loopback fixtures on high-core-count PCs.
 const concurrency = Math.min(4, availableParallelism());
-const result = spawnSync(process.execPath, ['--test', `--test-concurrency=${concurrency}`, 'test/*.test.mjs', ...process.argv.slice(2)], {
+const result = spawnSync(process.execPath, ['--test', `--test-concurrency=${concurrency}`, ...process.argv.slice(2), 'test/*.test.mjs'], {
   cwd: fileURLToPath(new URL('..', import.meta.url)),
   stdio: 'inherit',
   env: testEnvironment()

@@ -44,6 +44,9 @@ HALLUCINATION_PATTERNS = (
     r"(?:我們)?下(?:期|集)再見",
     r"優優獨播劇場(?:\s*[-—–]+\s*YoYo Television Series Exclusive)?",
 )
+LOG_PROB_THRESHOLD = -1.0
+COMPRESSION_RATIO_THRESHOLD = 2.4
+HOP_SAMPLES = 160
 _PUNCT = r"[\s，、,。！？!?.]*"
 
 # Local Whisper jobs can share this mutex before loading a model on the GPU: whoever
@@ -304,20 +307,57 @@ def remove_hallucinations(text):
     return text if re.search(r"\w", text) else ""
 
 
+def dictation_chunks(audio):
+    import numpy as np
+    from faster_whisper.vad import VadOptions, collect_chunks, get_speech_timestamps
+
+    # Leave headroom in Whisper's 30 s window. Silero prefers a short pause
+    # near the limit and splits continuous speech if there is no usable pause.
+    options = VadOptions(min_speech_duration_ms=100, min_silence_duration_ms=600, max_speech_duration_s=29)
+    # At EOF an open span includes the remaining silence. Give Silero time to
+    # close a Stop click at its true end before checking its speech duration.
+    flush_samples = SAMPLE_RATE * (options.min_silence_duration_ms + 100) // 1000
+    spans = get_speech_timestamps(np.pad(audio, (0, flush_samples)), options)
+    spans = [
+        {"start": span["start"], "end": min(span["end"], audio.size)}
+        for span in spans if span["start"] < audio.size
+    ]
+    chunks, _ = collect_chunks(audio, spans, max_duration=options.max_speech_duration_s)
+    return [chunk for chunk in chunks if chunk.size]
+
+
+def decode_chunk(model, chunk, hotwords, options):
+    """Decode speech; recheck low-confidence tails without prompt or hotword bias."""
+    segments = list(model.transcribe(chunk, initial_prompt=PROMPT, hotwords=hotwords, temperature=0.0, **options)[0])
+    weak = next((s.seek for s in segments if s.avg_logprob < LOG_PROB_THRESHOLD), None)
+    if weak is None:
+        if any(s.compression_ratio > COMPRESSION_RATIO_THRESHOLD for s in segments):
+            segments = list(model.transcribe(chunk, initial_prompt=PROMPT, hotwords=hotwords, **options)[0])
+        return segments
+    first = _tokens("".join(s.text for s in segments if s.seek >= weak))
+    unbiased = model.transcribe(chunk[weak * HOP_SAMPLES:], temperature=0.0, **options)[0]
+    return [s for s in segments if s.seek < weak] + [
+        s for s in unbiased if s.avg_logprob >= LOG_PROB_THRESHOLD and first & _tokens(s.text)
+    ]
+
+
+def _tokens(text):
+    """Latin words and single other characters, compared in Traditional script and lower case."""
+    return set(re.findall(r"[a-z0-9]+|[^\W\da-z_]", to_traditional(text).lower()))
+
+
 def transcribe(model, audio, vocabulary, on_gpu=True):
     hotwords, replacements = vocabulary
     # faster-whisper budgets hotwords and previous text separately (223 tokens each).
     # Together with control tokens they can exceed Whisper's 448-token context on
     # later windows. Keep hotwords, but do not carry decoded text into the next window.
-    # On the GPU, hallucination_silence_threshold (it needs word timestamps) skips a pause Whisper
-    # filled with made-up text; it costs nothing there but made a 9 s CPU dictation 60% slower, so the
-    # CPU uses the phrase filter to keep transcription latency down.
+    # Word alignment for the additional pause check made a 9 s CPU dictation 60% slower.
     pause_check = {"word_timestamps": True, "hallucination_silence_threshold": 2.0} if on_gpu else {}
-    segments, _ = model.transcribe(
-        audio, beam_size=5, language="zh", vad_filter=True, initial_prompt=PROMPT, hotwords=hotwords,
-        condition_on_previous_text=False, no_speech_threshold=0.5, **pause_check,
-    )
-    text = remove_hallucinations("".join(to_traditional(segment.text) for segment in segments).strip())
+    options = dict(beam_size=5, language="zh", condition_on_previous_text=False, no_speech_threshold=0.5, **pause_check)
+    parts = []
+    for chunk in dictation_chunks(audio):
+        parts.extend(to_traditional(segment.text) for segment in decode_chunk(model, chunk, hotwords, options))
+    text = remove_hallucinations("".join(parts).strip())
     for old, new in replacements:
         text = text.replace(old, new)
     return text

@@ -28,7 +28,7 @@ let state = {
   tools: [], questions: [], artifacts: [], capabilities: {}, conversationActivity: []
 };
 const writes = [], errors = [];
-let browser;
+let browser, acknowledgeSend;
 try {
   browser = await launchProbeBrowser();
   const page = await browser.newPage({viewport: {width: 1440, height: 1000}});
@@ -49,7 +49,8 @@ try {
       : url.pathname === '/api/projects' ? {projects: [{path: root, name: '測試工作區'}]}
       : url.pathname === '/api/sessions' ? {sessions: []}
       : url.pathname === '/api/models' ? {models}
-      : {};
+      : url.pathname === '/api/send' ? {sent: true} : {};
+    if (url.pathname === '/api/send') await new Promise(resolve => { acknowledgeSend = resolve; });
     await route.fulfill({json: body});
   });
   const update = async patch => {
@@ -161,6 +162,32 @@ try {
     await page.screenshot({path: path.join(output, `colab-composer-${width}.png`)});
   }
   assert.equal(writes.length, 0, 'Viewing labels and changing a draft effort must not send work or persist settings');
+  await update({threadId: 'neon-a', model: 'gemini-4-neon', provider: 'gemini', status: 'ready',
+    effort: 'xhigh', efforts: ['high', 'xhigh']});
+  const picker = page.getByRole('combobox', {name: '推理程度', exact: true});
+  await picker.selectOption('high');
+  // An incoming snapshot can refresh the saved setting before the person presses send.
+  await update({effort: 'medium'});
+  assert.equal(await picker.inputValue(), 'high');
+  await update({threadId: 'neon-b', effort: 'low'});
+  await page.waitForFunction(() => document.querySelector('.composer-effort select')?.value === '');
+  await update({threadId: 'neon-a', effort: 'xhigh'});
+  await page.waitForFunction(() => document.querySelector('.composer-effort select')?.value === 'high');
+  const message = page.getByRole('textbox', {name: '工作訊息', exact: true});
+  await message.fill('room effort');
+  const request = page.waitForRequest(req => new URL(req.url()).pathname === '/api/send');
+  await message.press('Enter');
+  const submitted = (await request).postDataJSON();
+  await update({threadId: 'neon-b', effort: 'low'});
+  await page.waitForFunction(() => document.querySelector('.composer-effort select')?.selectedOptions[0]?.textContent.includes('低'));
+  const acknowledged = page.waitForResponse(res => new URL(res.url()).pathname === '/api/send');
+  acknowledgeSend();
+  await acknowledged;
+  await update({threadId: 'neon-a', effort: 'high'});
+  await page.waitForFunction(() => document.querySelector('.composer-effort select')?.selectedOptions[0]?.textContent.includes('沿用設定（高）'));
+  assert.equal(submitted.threadId, 'neon-a');
+  assert.equal(submitted.effort, 'high');
+  assert.equal(writes.filter(item => item.path === '/api/send').length, 1);
   assert.deepEqual(errors, []);
   const result = {passed: true, checks: [
     'Claude saved effort is visible and agrees with model settings',
@@ -171,7 +198,8 @@ try {
     'mobile GPT draft effort yields to running effort',
     'Gemini and self-hosted labels follow state',
     'long Colab labels keep send controls aligned across phone, tablet and desktop widths',
-    'no native API writes or page errors'
+    'selection alone sends nothing; immediate navigation preserves the source room and effort in one mocked send',
+    'no page errors'
   ]};
   await writeFile(path.join(output, 'result.json'), JSON.stringify(result, null, 2) + '\n');
   console.log(JSON.stringify(result));

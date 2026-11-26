@@ -144,6 +144,11 @@ public class MainActivity extends Activity {
             public boolean nativeQuoteMenu() {
                 return true;
             }
+
+            @JavascriptInterface
+            public boolean selectionCommandHook() {
+                return true;
+            }
         }, "KApp");
 
         pendingThread.set(getIntent().getStringExtra(KService.EXTRA_THREAD));
@@ -203,9 +208,18 @@ public class MainActivity extends Activity {
     private final class QuoteMenu extends ActionMode.Callback2 {
         private static final int ID = 0x4b51; // "KQ"
         private final ActionMode.Callback inner;
+        private boolean finished;
 
         QuoteMenu(ActionMode.Callback inner) {
             this.inner = inner;
+        }
+
+        private String resourceName(MenuItem item) {
+            try {
+                return getResources().getResourceEntryName(item.getItemId());
+            } catch (android.content.res.Resources.NotFoundException e) {
+                return "";
+            }
         }
 
         private boolean keep(MenuItem item) {
@@ -216,20 +230,16 @@ public class MainActivity extends Activity {
             // Chromium's own entries use WebView resource ids whose numbers differ per WebView build,
             // so match them by resource name.
             if (id == 0) return false;
-            try {
-                switch (getResources().getResourceEntryName(id)) {
-                    case "select_action_menu_copy":
-                    case "select_action_menu_select_all":
-                    case "select_action_menu_cut":
-                    case "select_action_menu_paste":
-                    case "select_action_menu_paste_as_plain_text":
-                    case "select_action_menu_share":
-                        return true;
-                    default:
-                        return false;
-                }
-            } catch (android.content.res.Resources.NotFoundException e) {
-                return false;
+            switch (resourceName(item)) {
+                case "select_action_menu_copy":
+                case "select_action_menu_select_all":
+                case "select_action_menu_cut":
+                case "select_action_menu_paste":
+                case "select_action_menu_paste_as_plain_text":
+                case "select_action_menu_share":
+                    return true;
+                default:
+                    return false;
             }
         }
 
@@ -270,6 +280,42 @@ public class MainActivity extends Activity {
 
         @Override
         public boolean onActionItemClicked(ActionMode mode, MenuItem item) {
+            int id = item.getItemId();
+            String name = resourceName(item);
+            boolean copy = id == android.R.id.copy || name.equals("select_action_menu_copy");
+            boolean share = id == android.R.id.shareText || name.equals("select_action_menu_share");
+            if (id == android.R.id.selectAll || name.equals("select_action_menu_select_all")) {
+                web.evaluateJavascript("window.dispatchEvent(new Event('k-select-all'))", ignored -> {
+                    if (!finished) inner.onActionItemClicked(mode, item);
+                });
+                return true;
+            }
+            if (copy || share) {
+                web.evaluateJavascript("(()=>{const detail={};window.dispatchEvent(new CustomEvent('k-read-selection',{detail}));return detail.text??null})()", value -> {
+                    if (finished) return;
+                    if (value == null || value.equals("null")) {
+                        inner.onActionItemClicked(mode, item);
+                        return;
+                    }
+                    try {
+                        String text = (String)new org.json.JSONTokener(value).nextValue();
+                        if (text.isEmpty()) {
+                            mode.finish();
+                            return;
+                        }
+                        if (copy) {
+                            getSystemService(android.content.ClipboardManager.class).setPrimaryClip(ClipData.newPlainText("", text));
+                        } else {
+                            startActivity(Intent.createChooser(new Intent(Intent.ACTION_SEND).setType("text/plain")
+                                    .putExtra(Intent.EXTRA_TEXT, text), null));
+                        }
+                        mode.finish();
+                    } catch (org.json.JSONException | ActivityNotFoundException e) {
+                        Toast.makeText(MainActivity.this, "無法完成選取操作", Toast.LENGTH_SHORT).show();
+                    }
+                });
+                return true;
+            }
             if (item.getItemId() != ID) return inner.onActionItemClicked(mode, item);
             // Finish only after the page has read the selection.
             web.evaluateJavascript("window.dispatchEvent(new Event('k-add-selection'))", ignored -> mode.finish());
@@ -278,6 +324,7 @@ public class MainActivity extends Activity {
 
         @Override
         public void onDestroyActionMode(ActionMode mode) {
+            finished = true;
             inner.onDestroyActionMode(mode);
         }
 

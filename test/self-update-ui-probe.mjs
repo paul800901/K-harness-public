@@ -24,7 +24,7 @@ const state = {
 };
 let browser,
   update = {available: false, updating: false, failed: null},
-  answer = {status: 409, json: {error: '還有工作在跑，等結束再按。', busy: ['聊天室：小說 工作中']}},
+  answer = {status: 409, json: {error: '還有工作在跑，等結束再按。', busy: ['聊天室：測試 / 第一房 agy 背景程序保留中', 'Gemini 帳號額度查詢中']}},
   failStatusReads = 0,
   holdNextRead;
 const posts = [],
@@ -100,6 +100,8 @@ try {
 
   await updateButton(page).click();
   await page.locator('.self-update-notice').getByText('還有工作在跑，等結束再按。').waitFor();
+  assert.equal(await page.locator('.self-update-notice').innerText(), [answer.json.error, ...answer.json.busy].join('\n'));
+  await page.screenshot({path: path.join(output, 'desktop-busy.png')});
   assert.deepEqual(posts, [{}], 'one request with an empty body; the version is chosen by K');
 
   answer = {status: 200, json: {started: true}};

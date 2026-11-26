@@ -41,6 +41,8 @@ export const GROK_PROFILE = {
   // grok takes K's rules as session metadata and can reload a session it cannot resume.
   metaRules: true,
   loadFallback: true,
+  // 1.0.92 loads persisted sessions from the supplied workspace; another cwd returns FS_NOT_FOUND.
+  resumeSameDirectory: true,
   processPerAccessMode: false,
   notification(method, update, state) {
     if (

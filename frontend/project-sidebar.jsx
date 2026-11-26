@@ -8,10 +8,12 @@ import {
   Pin,
   Pencil,
   Archive,
+  ListOrdered,
   ArrowUp,
   ArrowDown,
   Ellipsis,
   Hourglass,
+  Terminal,
   LoaderCircle,
   MessageCircle,
   TriangleAlert
@@ -65,6 +67,7 @@ function ProjectMenu({
   previousProject,
   nextProject,
   manual,
+  onPosition,
   onMoveProject,
   onRenameProject,
   onProjectDetails,
@@ -87,6 +90,10 @@ function ProjectMenu({
           >
             <ArrowDown size={13} />
             下移工作區
+          </button>
+          <button onClick={() => onPosition({project: project.path})}>
+            <ListOrdered size={13} />
+            移到指定位置…
           </button>
         </>
       )}
@@ -126,6 +133,7 @@ function ProjectRow({
   previousProject,
   nextProject,
   manual,
+  onPosition,
   onMoveProject,
   unreadCount = 0,
   expandable = true
@@ -195,6 +203,7 @@ function ProjectRow({
         previousProject={previousProject}
         nextProject={nextProject}
         manual={manual}
+        onPosition={onPosition}
         onMoveProject={onMoveProject}
         onRenameProject={onRenameProject}
         onProjectDetails={onProjectDetails}
@@ -215,6 +224,7 @@ function SessionRows({
   onRename,
   onMetadata,
   onMove,
+  onPosition,
   onChooseWorkspace,
   manual,
   conversationActivity = []
@@ -224,8 +234,8 @@ function SessionRows({
   return sessions.map((s, index) => {
     const activity = activityById.get(s.threadId) ?? s,
       pending = pendingQuestionCount(activity),
-      activityLabel =
-        pending > 0 ? '待確認' : activity.busy ? '處理中' : activity.pendingWorkers > 0 ? '等待子代理' : '';
+      primaryLabel = pending > 0 ? '待確認' : activity.busy ? '處理中' : activity.pendingWorkers > 0 ? '等待子代理' : '',
+      activityLabel = [primaryLabel, activity.backgroundWork].filter(Boolean).join(' · ');
     return (
       <div
         key={s.threadId}
@@ -268,9 +278,10 @@ function SessionRows({
                 </>
               ) : activity.busy ? (
                 <LoaderCircle size={14} aria-hidden="true" />
-              ) : (
+              ) : activity.pendingWorkers > 0 ? (
                 <Hourglass size={14} aria-hidden="true" />
-              )}
+              ) : <Terminal size={14} aria-hidden="true" />}
+              {activity.backgroundWork && '背景工作'}
             </small>
           ) : unread.has(s.threadId) ? (
             <small
@@ -305,6 +316,10 @@ function SessionRows({
               >
                 <ArrowDown size={13} />
                 下移對話
+              </button>
+              <button onClick={() => onPosition({threadId: s.threadId})}>
+                <ListOrdered size={13} />
+                移到指定位置…
               </button>
             </>
           )}
@@ -347,6 +362,7 @@ export function ProjectSidebar({
   onRename,
   onMetadata,
   onMove,
+  onPosition,
   onMoveProject,
   onMoveWorkspace,
   onChooseWorkspace,
@@ -422,6 +438,7 @@ export function ProjectSidebar({
               previousProject={groups[index - 1]}
               nextProject={groups[index + 1]}
               manual={sort === 'manual'}
+              onPosition={onPosition}
               onMoveProject={onMoveProject}
               expanded={false}
               containsCurrent={projectKey(state.workspace) === projectKey(project.path)}
@@ -445,6 +462,7 @@ export function ProjectSidebar({
           onRename={onRename}
           onMetadata={onMetadata}
           onMove={onMove}
+          onPosition={onPosition}
           onChooseWorkspace={onChooseWorkspace}
           manual={sort === 'manual'}
           conversationActivity={conversationActivity}
@@ -472,6 +490,7 @@ export function ProjectSidebar({
               previousProject={groups[index - 1]}
               nextProject={groups[index + 1]}
               manual={sort === 'manual'}
+              onPosition={onPosition}
               onMoveProject={onMoveProject}
               expanded={expanded}
               containsCurrent={active}
@@ -501,6 +520,7 @@ export function ProjectSidebar({
                   onRename={onRename}
                   onMetadata={onMetadata}
                   onMove={onMove}
+                  onPosition={onPosition}
                   onChooseWorkspace={onChooseWorkspace}
                   manual={sort === 'manual'}
                   conversationActivity={conversationActivity}

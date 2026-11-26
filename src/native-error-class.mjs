@@ -16,6 +16,9 @@ export function recoveryErrorClass(error) {
   const hardCodes = [
     'contextWindowExceeded',
     'sessionBudgetExceeded',
+    'apiKeySpendLimitExceeded',
+    'projectSpendLimitExceeded',
+    'organizationSpendLimitExceeded',
     'usageLimitExceeded',
     'quotaExceeded',
     'budgetExceeded',
@@ -24,6 +27,7 @@ export function recoveryErrorClass(error) {
     'permissionDenied',
     'sandboxError',
     'cyberPolicy',
+    'bioPolicy',
     'misalignmentPolicyViolation',
     'tooManyDenials',
     'badRequest',

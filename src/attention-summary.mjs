@@ -13,6 +13,6 @@ export function attentionSummary(state) {
       title: rooms.get(item.threadId)?.title || '未命名聊天室'
     })),
     // A room whose main agent waits while its sub-agents still run is not idle.
-    working: [...rooms.values()].filter(room => room.busy || room.pendingWorkers > 0).length
+    working: [...rooms.values()].filter(room => room.busy || room.pendingWorkers > 0 || room.backgroundWork).length
   };
 }

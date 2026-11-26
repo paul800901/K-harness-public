@@ -101,6 +101,277 @@ test('same/newer installed version does not download or downgrade; prepared vers
   }
   await updater.close();
 });
+test('withheld release never downloads or changes selection, including an already prepared release', async () => {
+  for (const prepared of [false, true]) {
+    const f = await fixture();
+    await writeFile(f.active.gemini, '1.5.15');
+    const selection = path.join(f.root, 'selected-cores.json'),
+      withheld = path.join(f.root, 'withheld-cores.json'),
+      reason = '權限檢查未通過（2026-11-26）',
+      saved = JSON.stringify({
+        codex: {version: '1.0.0', file: 'codex.exe'},
+        gemini: {version: prepared ? '1.5.17' : '1.5.15', file: prepared ? 'prepared.exe' : 'gemini.exe'}
+      });
+    if (prepared) await writeFile(path.join(f.root, 'prepared.exe'), '1.5.17');
+    await writeFile(selection, saved);
+    const listed = JSON.stringify({gemini: {'1.5.17': reason}});
+    await writeFile(withheld, listed);
+    const before = await readdir(f.root);
+    let downloads = 0;
+    const updater = createCoreUpdates({
+      ...f,
+      release: async () => ({version: '1.5.17', file: 'core.exe'}),
+      download: async (...args) => (downloads++, f.download(...args))
+    });
+    try {
+      const result = await updater.update('gemini');
+      assert.equal(result.restartRequired, false);
+      assert.match(result.message, /Antigravity 官方最新版 1\.5\.17/u);
+      assert.ok(result.message.includes(reason));
+      assert.match(result.message, /暫不更新；目前維持 1\.5\.15/u);
+      if (prepared) {
+        assert.match(result.message, /下次啟動 K 時選用 1\.5\.17/u);
+        assert.match(result.message, /請先讓 AI 調整選用版本再重開 K/u);
+      }
+      assert.equal(downloads, 0);
+      assert.equal(await readFile(selection, 'utf8'), saved);
+      assert.equal(await readFile(withheld, 'utf8'), listed);
+      assert.deepEqual(await readdir(f.root), before);
+      assert.equal(await f.inspect(f.active.gemini), '1.5.15');
+    } finally {
+      await updater.close();
+    }
+  }
+});
+test('public default withholds the known incompatible Gemini release without local configuration', async () => {
+  const f = await fixture();
+  const updater = createCoreUpdates({
+    ...f,
+    release: async () => ({version: '1.5.17', file: 'core.exe'}),
+    download: () => assert.fail('known incompatible release must not download')
+  });
+  try {
+    for (const local of [null, {}]) {
+      if (local) await writeFile(path.join(f.root, 'withheld-cores.json'), JSON.stringify(local));
+      const result = await updater.update('gemini');
+      assert.equal(result.restartRequired, false);
+      assert.match(result.message, /工作區寫入權限實測未通過/u);
+      await assert.rejects(access(path.join(f.root, 'selected-cores.json')), {code: 'ENOENT'});
+    }
+  } finally {
+    await updater.close();
+  }
+});
+
+test('withheld running release reports the pending rollback on the next startup', async () => {
+  const f = await fixture(),
+    selection = path.join(f.root, 'selected-cores.json'),
+    rollback = {version: '1.5.15', file: 'rollback.exe'},
+    saved = JSON.stringify({gemini: {...rollback, previous: {version: '1.5.17', file: 'gemini.exe'}}});
+  await writeFile(f.active.gemini, '1.5.17');
+  await writeFile(path.join(f.root, rollback.file), rollback.version);
+  await writeFile(selection, saved);
+  await writeFile(path.join(f.root, 'withheld-cores.json'), JSON.stringify({gemini: {'1.5.17': '權限檢查未通過'}}));
+  const updater = createCoreUpdates({
+    ...f,
+    release: async () => ({version: '1.5.17'}),
+    download: () => assert.fail('no download during rollback')
+  });
+  try {
+    const result = await updater.update('gemini');
+    assert.equal(result.restartRequired, false);
+    assert.match(result.message, /目前維持 1\.5\.17/u);
+    assert.match(result.message, /下次啟動 K 時選用 1\.5\.15/u);
+    assert.doesNotMatch(result.message, /調整選用版本/u);
+    assert.equal(await readFile(selection, 'utf8'), saved);
+    const next = await selectedCoreExecutables(f.root, f.active);
+    assert.equal(await f.inspect(next.gemini), rollback.version);
+    assert.deepEqual(f.recycled, []);
+    await assert.rejects(access(path.join(f.root, 'updates')), {code: 'ENOENT'});
+  } finally {
+    await updater.close();
+  }
+});
+test('new releases preserve the rollback binary while the running core is withheld', async () => {
+  for (const rollbackSelected of [true, false]) {
+    const f = await fixture(),
+      selection = path.join(f.root, 'selected-cores.json'),
+      entries = {};
+    for (const version of ['1.5.15', '1.5.17']) {
+      const directory = path.join('updates', `gemini-${version}-fixture`);
+      await mkdir(path.join(f.root, directory), {recursive: true});
+      entries[version] = {version, file: path.join(directory, 'agy.exe')};
+      await writeFile(path.join(f.root, entries[version].file), version);
+    }
+    const rollback = entries['1.5.15'],
+      running = entries['1.5.17'];
+    f.active.gemini = path.join(f.root, running.file);
+    await writeFile(selection, JSON.stringify({
+      gemini: rollbackSelected ? {...rollback, previous: running} : {...running, previous: rollback}
+    }));
+    await writeFile(path.join(f.root, 'withheld-cores.json'), JSON.stringify({gemini: {'1.5.17': '權限檢查未通過'}}));
+    let version;
+    const updater = createCoreUpdates({...f, release: async () => ({version, file: 'agy.exe'})});
+    try {
+      for (version of ['1.5.18', '1.5.170']) {
+        assert.equal((await updater.update('gemini')).restartRequired, true);
+        const {gemini} = JSON.parse(await readFile(selection, 'utf8'));
+        assert.equal(gemini.version, version);
+        assert.deepEqual(gemini.previous, rollback);
+        assert.equal(await f.inspect(path.join(f.root, gemini.previous.file)), rollback.version);
+        assert.equal(await f.inspect(f.active.gemini), running.version);
+      }
+      assert.equal(f.recycled.length, 1);
+      assert.match(f.recycled[0], /^gemini-1\.5\.18-/u);
+    } finally {
+      await updater.close();
+    }
+  }
+});
+test('withheld versions match only that provider and version; a later release updates normally', async () => {
+  const f = await fixture(),
+    withheld = path.join(f.root, 'withheld-cores.json'),
+    listed = JSON.stringify({gemini: {'1.5.17': '權限檢查未通過（2026-11-26）'}});
+  await writeFile(f.active.gemini, '1.5.15');
+  await writeFile(withheld, listed);
+  let downloads = 0;
+  const updater = createCoreUpdates({
+    ...f,
+    release: async provider => ({version: provider === 'gemini' ? '1.5.18' : '1.5.17', file: 'core.exe'}),
+    download: async (...args) => (downloads++, f.download(...args))
+  });
+  try {
+    for (const provider of ['codex', 'gemini']) assert.equal((await updater.update(provider)).restartRequired, true);
+    assert.equal(downloads, 2);
+    const selected = JSON.parse(await readFile(path.join(f.root, 'selected-cores.json'), 'utf8'));
+    assert.equal(selected.gemini.version, '1.5.18');
+    assert.equal(selected.codex.version, '1.5.17');
+    assert.equal(await f.inspect(path.join(f.root, selected.gemini.file)), '1.5.18');
+    assert.equal(await readFile(withheld, 'utf8'), listed);
+    for (const provider of ['claude', 'grok', 'deepseek']) {
+      const result = await updater.update(provider);
+      assert.equal(result.restartRequired, true);
+      assert.ok(result.message.includes('1.5.17 已準備好'));
+      assert.ok(!result.message.includes('權限檢查'));
+    }
+    assert.equal(downloads, 5);
+  } finally {
+    await updater.close();
+  }
+});
+test('withheld pre-release versions use the complete version string from the official release', async () => {
+  const f = await fixture();
+  const version = '0.2.3-alpha.2';
+  await writeFile(path.join(f.root, 'withheld-cores.json'), JSON.stringify({deepseek: {[version]: '測試未通過'}}));
+  let officialVersion = [version];
+  const updater = createCoreUpdates({...f, release: async () => ({version: officialVersion, file: 'core.exe'})});
+  try {
+    await assert.rejects(updater.update('deepseek'), /官方核心版本資料無效/u);
+    officialVersion = version;
+    assert.equal((await updater.update('deepseek')).restartRequired, false);
+    await assert.rejects(access(path.join(f.root, 'updates')), {code: 'ENOENT'});
+    officialVersion = '0.2.3-alpha.20';
+    assert.equal((await updater.update('deepseek')).restartRequired, true);
+    const next = await selectedCoreExecutables(f.root, f.active);
+    assert.equal(await f.inspect(next.deepseek), officialVersion);
+  } finally {
+    await updater.close();
+  }
+});
+test('withheld file may be absent and is not created by a normal update', async () => {
+  const f = await fixture(),
+    withheld = path.join(f.root, 'withheld-cores.json');
+  await writeFile(f.active.gemini, '1.5.15');
+  let downloads = 0;
+  const updater = createCoreUpdates({
+    ...f,
+    release: async () => ({version: '1.5.18', file: 'core.exe'}),
+    download: async (...args) => (downloads++, f.download(...args))
+  });
+  try {
+    await assert.rejects(access(withheld), {code: 'ENOENT'});
+    assert.equal((await updater.update('gemini')).restartRequired, true);
+    assert.equal(downloads, 1);
+    assert.equal(JSON.parse(await readFile(path.join(f.root, 'selected-cores.json'), 'utf8')).gemini.version, '1.5.18');
+    await assert.rejects(access(withheld), {code: 'ENOENT'});
+  } finally {
+    await updater.close();
+  }
+});
+test('withheld file with malformed JSON or invalid entries refuses the update without changing files', async () => {
+  const f = await fixture(),
+    withheld = path.join(f.root, 'withheld-cores.json'),
+    selection = path.join(f.root, 'selected-cores.json'),
+    saved = JSON.stringify({gemini: {version: '1.0.0', file: 'gemini.exe'}});
+  await writeFile(selection, saved);
+  let downloads = 0;
+  const updater = createCoreUpdates({
+    ...f,
+    download: async (...args) => (downloads++, f.download(...args))
+  });
+  try {
+    for (const bad of [
+      'bad json',
+      'null',
+      '[]',
+      '{"gemini":[]}',
+      '{"gemini":{"1.0.1":false}}',
+      '{"gemini":{"1.0.1":""}}'
+    ]) {
+      await writeFile(withheld, bad);
+      await assert.rejects(
+        updater.update('gemini'),
+        error => error.message.includes('名單檔讀取失敗') && error.message.includes(withheld)
+      );
+      assert.equal(updater.pending, false);
+      assert.equal(downloads, 0);
+      assert.equal(await readFile(selection, 'utf8'), saved);
+      assert.equal(await readFile(withheld, 'utf8'), bad);
+      await assert.rejects(access(path.join(f.root, 'updates')), {code: 'ENOENT'});
+    }
+  } finally {
+    await updater.close();
+  }
+});
+test('withheld file read errors refuse the update rather than treating the list as absent', async () => {
+  const f = await fixture(),
+    withheld = path.join(f.root, 'withheld-cores.json');
+  await mkdir(withheld);
+  let downloads = 0;
+  const updater = createCoreUpdates({
+    ...f,
+    download: async (...args) => (downloads++, f.download(...args))
+  });
+  try {
+    await assert.rejects(updater.update('gemini'), /名單檔讀取失敗/u);
+    assert.equal(downloads, 0);
+    await assert.rejects(access(path.join(f.root, 'selected-cores.json')), {code: 'ENOENT'});
+    await assert.rejects(access(path.join(f.root, 'updates')), {code: 'ENOENT'});
+  } finally {
+    await updater.close();
+  }
+});
+test('Gemini ready messages remind about permission checks for new and already prepared releases only', async () => {
+  const f = await fixture();
+  for (const provider of ['grok', 'deepseek']) {
+    f.active[provider] = path.join(f.root, `${provider}.exe`);
+    await writeFile(f.active[provider], '1.0.0');
+  }
+  let downloads = 0;
+  const updater = createCoreUpdates({...f, download: async (...args) => (downloads++, f.download(...args))});
+  try {
+    for (const provider of ['gemini', 'claude', 'codex', 'grok', 'deepseek']) {
+      for (let click = 0; click < 2; click++) {
+        const result = await updater.update(provider);
+        assert.equal(result.restartRequired, true);
+        assert.equal(result.message.includes('重新開啟前請先讓 AI 跑權限檢查'), provider === 'gemini');
+      }
+    }
+    assert.equal(downloads, 5);
+  } finally {
+    await updater.close();
+  }
+});
 test('failed download or version readback leaves selected cores and unrelated data untouched', async () => {
   const f = await fixture();
   await writeFile(path.join(f.root, 'unrelated.txt'), 'keep');

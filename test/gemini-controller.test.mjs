@@ -328,9 +328,10 @@ test('Gemini reopens native history without replaying earlier user text and reta
   const f = await fixture();
   let c = f.controller;
   try {
-    const {threadId} = await c.open({model: 'gemini-3.8-flash', effort: 'medium'});
-    await c.send({text: 'first private context'});
+    const {threadId} = await c.open({model: 'gemini-3.8-flash', effort: 'high'});
+    await c.send({text: 'first private context', effort: 'medium'});
     await finish(c);
+    assert.equal(reqOf(f.calls.at(-1), 'session/set_model')?.params?.modelId, 'gemini-3.8-flash-medium');
     const native = JSON.parse(
       await readFile(path.join(f.root, '.runtime/gemini-sessions', threadId + '.json'), 'utf8')
     ).nativeSessionId;

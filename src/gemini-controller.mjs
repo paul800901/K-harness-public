@@ -1,4 +1,5 @@
 import {createWorkActivity} from './work-activity.mjs';
+import {restoreGeminiReplyOrder} from './gemini-reply-order.mjs';
 import {
   discardStaleWorkerQuestions,
   workerNoticeKey,
@@ -64,6 +65,10 @@ const access = value => {
   return value;
 };
 const now = () => new Date().toISOString();
+const terminalToolStatus = new Map([
+  ['completed', 'completed'], ['failed', 'failed'], ['error', 'failed'],
+  ['cancelled', 'cancelled'], ['canceled', 'cancelled']
+]);
 
 const roomOperations = new Map();
 const pendingRollbackSaves = new Map();
@@ -280,7 +285,7 @@ export function createGeminiController({
     stopSequence = 0,
     turn = null,
     persist = Promise.resolve(),
-    unresolvedPid = null,
+    unresolvedProcess = null,
     // An agy process kept after its turn because native background commands still run in it
     // (closing stdin makes agy terminate them). agy sends nothing while no prompt is open; the
     // next prompt on this same process first delivers what happened meanwhile.
@@ -358,7 +363,7 @@ export function createGeminiController({
   // Sends and model changes go to a held process; anything that would replace it waits.
   const idle = (allowHeld = false) => {
     official.assertStable();
-    if (state.busy || opening || unresolvedPid || held?.stopping) throw Error('請先結束或查明目前 Gemini 工作。');
+    if (state.busy || opening || stopping || unresolvedProcess || held?.stopping) throw Error('請先結束或查明目前 Gemini 工作。');
     if (held && !allowHeld)
       throw Error('agy 背景命令仍在本聊天室執行；等它完成（下一次送出時由 agy 回報）或按停止後再切換。');
   };
@@ -448,7 +453,7 @@ export function createGeminiController({
       try {
         await proc.agent.close({graceMs: stopGraceMs});
       } catch (error) {
-        unresolvedPid = proc.agent.pid;
+        unresolvedProcess = proc.agent;
         settleCommands(proc, 'unresolved');
         state.status = 'uncertain';
         state.error = `agy 背景命令停止未確認：${error.message}`;
@@ -608,7 +613,7 @@ export function createGeminiController({
       !record ||
       state.busy ||
       opening ||
-      unresolvedPid ||
+      unresolvedProcess ||
       !['completed', 'ready'].includes(state.status) ||
       (!workerQueue.size && !handoff)
     )
@@ -862,7 +867,7 @@ export function createGeminiController({
         current.stopping ||
         opening ||
         preparingContinuation ||
-        unresolvedPid
+        unresolvedProcess
       )
         throw Error('只能在本主聊天室的進行中回合換房；未受理。');
       if (noticePending()) throw Error('K 子代理通知尚未送達本聊天室；待通知送完後再換房。');
@@ -896,7 +901,7 @@ export function createGeminiController({
                   state.threadId !== parent ||
                   selection() !== sourceSelection ||
                   opening ||
-                  unresolvedPid ||
+                  unresolvedProcess ||
                   noticePending() ||
                   state.status === 'interrupted'
                 )
@@ -1082,7 +1087,7 @@ export function createGeminiController({
       turn === current &&
       state.busy &&
       !opening &&
-      !unresolvedPid &&
+      !unresolvedProcess &&
       !current.closing &&
       !current.stopping &&
       !current.abort.signal.aborted &&
@@ -1108,7 +1113,7 @@ export function createGeminiController({
       try {
         await current.agent.close({graceMs: 0});
       } catch (error) {
-        unresolvedPid = current.agent.pid ?? current.pid;
+        unresolvedProcess = current.agent;
         current.stopCloseError = error;
         state.status = 'uncertain';
         state.error = `${uncertainPrefix}：${error.message}`;
@@ -1119,6 +1124,10 @@ export function createGeminiController({
   };
   const api = {
     state,
+    get backgroundWork() {
+      if (unresolvedProcess) return 'Gemini 程序停止待確認';
+      return held ? 'agy 背景程序保留中' : null;
+    },
     async models() {
       const result = await official.status({checkAuth: false});
       if (!result.available) throw Error(result.reason);
@@ -1265,6 +1274,10 @@ export function createGeminiController({
         state.goal = record.goal
           ? {...record.goal, ...(['active', 'starting'].includes(record.goal.status) ? {status: 'unknown'} : {})}
           : null;
+        if (saved) {
+          await restoreGeminiReplyOrder(state.messages, home(), record.nativeSessionId);
+          assertActive();
+        }
         await onHistory?.(state);
         assertActive();
         await prepare({assertActive});
@@ -1692,14 +1705,10 @@ export function createGeminiController({
               const index = state.tools.findIndex(t => t.id === key);
               const existing = index >= 0 ? state.tools[index] : null;
               const name = update.name ?? existing?.name ?? update.title ?? update.kind ?? 'tool';
+              // Updates can carry only metadata. Once this ID has ended, a later patch
+              // must not register it as a new background command and keep the lease.
               const status =
-                update.status === 'failed'
-                  ? 'failed'
-                  : update.status === 'completed'
-                    ? 'completed'
-                    : (existing?.status ?? 'running') === 'completed'
-                      ? 'completed'
-                      : 'running';
+                existing && existing.status !== 'running' ? existing.status : (terminalToolStatus.get(update.status) ?? 'running');
               const entry = {
                 id: key,
                 kind: update.kind ?? existing?.kind ?? name,
@@ -1850,7 +1859,6 @@ export function createGeminiController({
                 }));
               proc.agent = agent;
               current.agent = agent;
-              current.pid = agent.pid;
               void save(user.createdAt).catch(error => {
                 state.error = `對話活動時間保存失敗：${error.message}`;
                 changed();
@@ -1924,15 +1932,30 @@ export function createGeminiController({
                 try {
                   await agent.close({graceMs: stopGraceMs});
                 } catch (error) {
-                  unresolvedPid = agent.pid ?? current.pid;
+                  unresolvedProcess = agent;
                   state.status = 'uncertain';
                   state.error = `agy 程序結束未確認，未重送：${error.message}`;
+                }
+              }
+              const entry = current.prompts[0];
+              if (reuse && !unresolvedProcess && !current.abort.signal.aborted && !current.uncertain &&
+                  !current.error && current.prompts.length === 1 && entry?.awaitEcho && !entry.error &&
+                  entry.stopReason === 'end_turn' && !entry.rawText && proc.wake?.groupId === user.groupId) {
+                const reply = await restoreGeminiReplyOrder(state.messages, roomHome, record.nativeSessionId, user);
+                if (reply) {
+                  entry.assistant = reply;
+                  entry.rawText = reply.text;
+                  if (!current.abort.signal.aborted) {
+                    delete reply.partial;
+                    reply.completedAt = now();
+                  }
+                  proc.wake = null;
                 }
               }
               const anyOutput = current.prompts.some(p => p.rawText.trim().length > 0);
               const anyGoalComplete = current.prompts.some(p => p.goalCompleted);
               const firstError = current.error ?? current.prompts.find(p => p.error)?.error ?? null;
-              if (unresolvedPid) {
+              if (unresolvedProcess) {
                 // Keep uncertain status & error set during close/stop escalation.
               } else if (current.abort.signal.aborted) {
                 state.status = 'interrupted';
@@ -1959,7 +1982,9 @@ export function createGeminiController({
                 state.error = 'agy 在回覆完成前結束，已保留收到的內容。';
               } else if (!anyOutput) {
                 state.status = 'failed';
-                state.error = 'agy no output produced（沒有最終回答）。';
+                state.error = entry?.awaitEcho && proc.wake
+                  ? 'Gemini 已回傳文字，但未能確認屬於這次提問或先前的背景工作。內容已保留，未重送。'
+                  : 'Gemini 結束了這次回合，沒有回傳最終回答。';
               } else if (!record.nativeSessionId) {
                 state.status = 'uncertain';
                 state.error = 'agy 沒有回傳原生對話 ID；不能自動重送。';
@@ -1970,7 +1995,7 @@ export function createGeminiController({
               if (goalObjective)
                 state.goal = {
                   ...state.goal,
-                  status: unresolvedPid
+                  status: unresolvedProcess
                     ? 'unknown'
                     : state.status === 'interrupted'
                       ? 'interrupted'
@@ -1984,7 +2009,7 @@ export function createGeminiController({
               current.closing = true;
               readyResolve();
               if (error.unresolvedPid) {
-                unresolvedPid = error.unresolvedPid;
+                unresolvedProcess = error.unresolvedProcess ?? {pid: error.unresolvedPid};
                 state.status = 'uncertain';
                 state.error = error.message;
                 if (goalObjective) state.goal = {...state.goal, status: 'unknown'};
@@ -1996,12 +2021,12 @@ export function createGeminiController({
                   try {
                     await current.agent.close({graceMs: stopGraceMs});
                   } catch (closeError) {
-                    unresolvedPid = current.agent.pid ?? current.pid;
+                    unresolvedProcess = current.agent;
                     state.status = 'uncertain';
                     state.error = `agy 程序結束未確認，未重送：${closeError.message}`;
                   }
                 }
-                if (!unresolvedPid) {
+                if (!unresolvedProcess) {
                   if (!sessionNewAttempted && !record.nativeSessionId) record.nativeStarted = false;
                   if (current.abort.signal.aborted || error.name === 'AbortError') {
                     state.status = 'interrupted';
@@ -2014,7 +2039,7 @@ export function createGeminiController({
                 if (goalObjective)
                   state.goal = {
                     ...state.goal,
-                    status: unresolvedPid ? 'unknown' : state.status === 'interrupted' ? 'interrupted' : 'failed'
+                    status: unresolvedProcess ? 'unknown' : state.status === 'interrupted' ? 'interrupted' : 'failed'
                   };
               }
             } finally {
@@ -2034,7 +2059,7 @@ export function createGeminiController({
               keep &&= !current.abort.signal.aborted && !proc.agent.exited;
               if (keep) holdProcess(proc, accountLease);
               else if (proc.commands.size)
-                settleCommands(proc, unresolvedPid ? 'unresolved' : current.abort.signal.aborted ? 'stopped' : 'ended');
+                settleCommands(proc, unresolvedProcess ? 'unresolved' : current.abort.signal.aborted ? 'stopped' : 'ended');
               if (keep) accountLease = null;
               const heldKeys = new Set(keep ? [...proc.commands.values()].map(c => c.key) : []);
               for (const tool of state.tools)
@@ -2048,7 +2073,7 @@ export function createGeminiController({
                 )
                   Object.assign(
                     worker,
-                    unresolvedPid ? {status: 'unresolved'} : {status: 'ended', settled: true, endedAt: now()}
+                    unresolvedProcess ? {status: 'unresolved'} : {status: 'ended', settled: true, endedAt: now()}
                   );
               try {
                 await save(anyAssistant ? now() : undefined);
@@ -2057,7 +2082,7 @@ export function createGeminiController({
                 state.error = `對話保存失敗；未重送：${error.message}`;
               }
               try {
-                await accountLease?.release({settled: !unresolvedPid, refresh: true});
+                await accountLease?.release({settled: !unresolvedProcess, refresh: true});
               } catch {
                 state.status = 'uncertain';
                 state.error = 'Gemini 帳號狀態保存失敗；原工作未重送。';
@@ -2104,20 +2129,21 @@ export function createGeminiController({
       if (!current) return;
       if (current.discussionId !== id) throw Error('主持回合歸屬已改變；未中止其他工作。');
       await cancelTurn(current, '主持回合程序停止未確認');
-      if (unresolvedPid) throw Error('主持回合程序停止未確認。');
+      if (unresolvedProcess) throw Error('主持回合程序停止未確認。');
     },
     async stop() {
       stopSequence++;
       stopping++;
       try {
         const current = turn;
-        const previousUnresolved = !current ? unresolvedPid : null;
+        const previousUnresolved = !current ? unresolvedProcess : null;
         if (current) await cancelTurn(current, 'agy 停止未確認');
         const hadHeld = Boolean(held);
         if (hadHeld) await stopHeld();
         if (previousUnresolved) {
-          await killTree(previousUnresolved);
-          unresolvedPid = null;
+          // The original handle may have observed exit since the unconfirmed stop. Its PID can be reused.
+          if (!previousUnresolved.exited) await killTree(previousUnresolved.pid);
+          unresolvedProcess = null;
           // Native subagents lived inside that confirmed-ended agy process.
           for (const worker of state.workers)
             if (worker.provider === 'gemini-native' && !worker.settled)
@@ -2145,14 +2171,14 @@ export function createGeminiController({
         }
         if (state.status !== 'offline') await save();
         changed();
-        return {stopped: true};
+        return {stopped: !unresolvedProcess};
       } finally {
         stopping--;
       }
     },
     async close() {
       await api.stop();
-      if (unresolvedPid) throw Error('agy 程序停止尚未確認。');
+      if (unresolvedProcess) throw Error('agy 程序停止尚未確認。');
       await persist;
       state.status = 'offline';
       changed();
@@ -2265,7 +2291,7 @@ export function createGeminiController({
         !state.busy &&
         !turn &&
         !held &&
-        !unresolvedPid &&
+        !unresolvedProcess &&
         !noticePending() &&
         state.status === 'completed' &&
         !state.questions.length &&

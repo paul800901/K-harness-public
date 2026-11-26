@@ -367,12 +367,6 @@ try {
     await page.evaluate(() => sessionStorage.setItem('k-draft:voice-room-A', 'A 較新儲存草稿'));
     await openRoom(page, roomA);
     await page.getByRole('button', {name: '取消聽寫', exact: true}).waitFor();
-    if (viewport.mobile)
-      assert.equal(
-        await page.getByRole('button', {name: '轉錄完成後送出', exact: true}).count(),
-        0,
-        'remote/mobile has no send-after-transcription control'
-      );
     assert.equal(
       await input.inputValue(),
       'A 較新儲存草稿',
@@ -495,7 +489,28 @@ try {
       window.__micGate = null;
     });
     await assertNoSend();
-    if (!viewport.mobile) {
+    if (viewport.mobile) {
+      plan = await beginTranscription(page, '手機離線草稿', '回到前景再送', true);
+      await page.evaluate(() => Object.defineProperty(document, 'visibilityState', {configurable: true, value: 'hidden'}));
+      await hideApp();
+      await page.waitForFunction(() => !document.querySelector('.remote-connection.connected'));
+      await resolvePlan(page, plan);
+      await page.getByText('目前未連線，聽寫文字已留在草稿，請在連線後送出。', {exact: true}).waitFor();
+      assert.equal(await input.inputValue(), '手機離線草稿\n回到前景再送');
+      await page.evaluate(() => Reflect.deleteProperty(document, 'visibilityState'));
+      await showApp();
+      await page.locator('.remote-connection.connected').waitFor();
+      await assertNoSend();
+      for (const background of [false, true]) {
+        plan = await beginTranscription(page, '手機草稿', '箭頭送出', true);
+        if (background) await openRoom(page, roomB);
+        await resolvePlan(page, plan);
+        await waitForSends(background ? 2 : 1);
+        assert.equal(sends().at(-1).threadId, roomA.threadId);
+        assert.equal(sends().at(-1).text, '手機草稿\n箭頭送出');
+        if (background) assert.equal(await input.inputValue(), 'B 草稿');
+      }
+    } else {
       // Send intent survives leaving A and a hidden window past the former 120 s cutoff, and sends once to A
       // with A's own draft and attachment; B keeps its draft.
       await input.fill('');
@@ -659,6 +674,7 @@ try {
           'hidden app callback/mobile visibility does not cancel a stopped transcription',
           'hidden or room switch while recording ends capture and fills only the source draft',
           `desktop send intent survives room switch + hidden window for ${longHoldMs} ms and sends once to A with its draft and attachment`,
+          'mobile arrow sends once to the source room in foreground or after switching rooms; offline completion keeps draft and explains how to send',
           'desktop send intent is shown and kept after returning before completion',
           'rejected background send is not retried, keeps the draft, labels the global error and notices in A',
           'hidden while the microphone is starting cancels in A and stops the late stream before any recording',

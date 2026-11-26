@@ -969,6 +969,82 @@ test('opening an idle room can still reconnect its failed worker connection with
   }
 });
 
+test('background owners reach the room and activity views without inflating the agent quick view', async () => {
+  const f = await fixture(), c = f.controller;
+  try {
+    const claude = await c.open({model: claudeModel}), shell = f.room(claude.threadId);
+    shell.state.workers = [
+      {kind: 'command', status: 'running'},
+      {kind: 'command', status: 'completed', settled: true},
+      {kind: 'command', status: 'unresolved', executionUnowned: true}
+    ];
+    const codex = await c.open({model: codexModel}), native = f.room(codex.threadId);
+    native.backgroundCommands = async () => {
+      native.state.backgroundWork = 'Codex 背景命令未結束';
+      return 2;
+    };
+    await c.open({...codex, model: codexModel});
+    await eventually(() => c.state.backgroundWork === 'Codex 背景命令未結束');
+    assert.equal(await c.backgroundCommands(), 3);
+    assert.equal(c.state.backgroundWork, 'Codex 背景命令未結束');
+    assert.deepEqual(c.state.conversationActivity.map(a => [a.threadId, a.backgroundWork, a.pendingWorkers]), [
+      [claude.threadId, 'Claude 背景命令未結束', 0], [codex.threadId, 'Codex 背景命令未結束', 0]
+    ]);
+    assert.deepEqual(c.state.workerDetails, []);
+    assert.equal(c.state.workerActivity.running, 0);
+    await c.stop({...claude, backgroundOnly: true});
+    assert.equal(shell.calls.filter(([name]) => name === 'stop').length, 1);
+    assert.equal(native.calls.filter(([name]) => name === 'stop').length, 0);
+    shell.state.workers.shift();
+    assert.equal(c.state.conversationActivity.find(a => a.threadId === claude.threadId).backgroundWork, null);
+    await assert.rejects(c.stop({...claude, backgroundOnly: true}), /狀態已改變/);
+    const stopping = c.stop({...codex, backgroundOnly: true});
+    native.state.busy = true;
+    await assert.rejects(stopping, /狀態已改變/, 'a native turn that starts while pausing the queue is protected');
+    await assert.rejects(c.stop({...codex, backgroundOnly: true}), /狀態已改變/);
+    native.state.busy = false;
+    native.backgroundCommands = async () => { throw Error('native list failed'); };
+    await assert.rejects(c.backgroundCommands(), e => e.unconfirmedRooms?.[0]?.threadId === codex.threadId);
+    assert.equal(native.calls.filter(([name]) => name === 'stop').length, 0);
+  } finally {
+    await c.close();
+  }
+});
+
+test('an unresolved process remains reachable when selecting its room from another conversation', async () => {
+  const f = await fixture(), c = f.controller;
+  try {
+    const first = await c.open({model: claudeModel}), source = f.room(first.threadId);
+    source.state.status = 'uncertain';
+    source.state.backgroundWork = 'Claude 工作停止待確認';
+    const other = await c.open({model: codexModel});
+    await c.open({...first, model: claudeModel});
+    assert.equal(c.state.threadId, first.threadId);
+    assert.equal(c.state.backgroundWork, 'Claude 工作停止待確認');
+    assert.equal(source.calls.filter(([name]) => name === 'open').length, 1);
+    await c.stop({...first, backgroundOnly: true});
+    assert.equal(source.calls.filter(([name]) => name === 'stop').length, 1);
+    assert.equal(f.room(other.threadId).calls.filter(([name]) => name === 'stop').length, 0);
+  } finally {
+    await c.close();
+  }
+});
+
+test('idle room release preserves a Codex terminal known only to the native host', async () => {
+  const f = await fixture(), c = f.controller;
+  try {
+    const first = await c.open({model: codexModel}), native = f.room(first.threadId);
+    let reads = 0;
+    native.backgroundCommands = async () => { reads++; return 1; };
+    for (let i = 0; i < 6; i++) await c.open({model: codexModel});
+    await eventually(() => reads > 0 && f.native.some(room => room.closed > 0));
+    assert.equal(native.closed, 0);
+    assert.ok(c.state.conversationActivity.some(row => row.threadId === first.threadId));
+  } finally {
+    await c.close();
+  }
+});
+
 test('idle room release keeps four recent rooms and reopens older history on its original thread', async () => {
   const f = await fixture(),
     c = f.controller;
@@ -1198,6 +1274,11 @@ test('HTTP desktop routes preserve thread context for stop, approvals, files and
     assert.equal((await post('stop', a)).status, 200);
     assert.equal(f.room(a.threadId).state.busy, false);
     assert.equal(f.room(b.threadId).state.busy, true);
+    assert.equal((await post('stop', {...b, backgroundOnly: true})).status, 400);
+    f.room(a.threadId).state.workers = [{kind: 'command', status: 'running', settled: false}];
+    assert.equal((await post('stop', {...a, backgroundOnly: true})).status, 200);
+    assert.equal(f.room(b.threadId).state.busy, true);
+    f.room(a.threadId).state.workers = [];
     const artifact = await fetch(`${app.origin}/api/artifact?path=result.txt&threadId=${a.threadId}`, {
       headers: {cookie}
     });

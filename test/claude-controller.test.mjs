@@ -3485,11 +3485,13 @@ test('failed Claude stop retains host and a later confirmed stop can retry it', 
     };
     await assert.rejects(f.controller.stop(), /stop close unconfirmed/);
     assert.equal(f.controller.state.status, 'uncertain');
+    assert.match(f.controller.backgroundWork, /Claude.*停止待確認/);
     assert.equal(f.host, retained);
     assert.equal(closes, 1);
     await f.controller.stop();
     assert.equal(closes, 2);
     assert.equal(f.controller.state.status, 'interrupted');
+    assert.equal(f.controller.backgroundWork, null);
   } finally {
     await f.controller.close();
   }

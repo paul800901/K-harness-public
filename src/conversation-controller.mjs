@@ -209,6 +209,7 @@ export function createConversationController({
   const discussions = new Map();
   const historyVersions = new WeakMap();
   const discussion = controller => discussions.get(controller.state.threadId);
+  const ownedCommand = w => w.kind === 'command' && w.executionUnowned !== true && !workerEnded(w);
   const projected = controller => {
     const s = controller.state,
       d = discussion(controller),
@@ -216,6 +217,8 @@ export function createConversationController({
       continuation = continuationStates.get(controller);
     return {
       ...s,
+      backgroundWork: s.backgroundWork ??
+        ((s.workers ?? []).some(ownedCommand) ? (s.provider === 'claude' ? 'Claude 背景命令未結束' : '背景命令未結束') : null),
       ...(continuation
         ? {
             continuation,
@@ -314,9 +317,11 @@ export function createConversationController({
       threadId: s.threadId,
       title: s.title || '',
       workspace: s.workspace,
+      provider: s.provider,
       busy: !!s.busy,
       status: s.status,
       pendingQuestions: s.questions?.length ?? 0,
+      backgroundWork: s.backgroundWork,
       // Same rule as the top quick view: unfinished workers this room still owns.
       pendingWorkers: (s.workers ?? []).filter(
         worker => worker.kind !== 'command' && !workerEnded(worker) && worker.executionUnowned !== true
@@ -989,6 +994,7 @@ export function createConversationController({
     if (!(await read(listMainSessions(root))).sessions.some(row => row.threadId === s.threadId)) return false;
     const workers = await read(workerRows(controller));
     if (workers.some(workerMayBeLive)) return false;
+    if (await read(controller.backgroundCommands?.())) return false;
     if (s.browserAccess?.enabled) {
       // A registered external gateway with no selected mode has never started a
       // browser. Do not confuse that idle state with lost/unavailable control.
@@ -1003,6 +1009,7 @@ export function createConversationController({
       !discussion(controller)?.busy &&
       !discussion(controller)?.held &&
       !latest.busy &&
+      !latest.backgroundWork &&
       !latest.goalPending &&
       !(
         latest.capabilities?.goalContinuesWhileIdle &&
@@ -1105,6 +1112,10 @@ export function createConversationController({
           if (configure) throw Error('此聊天室正在更新，請稍候。');
           return {controller: existing, result: {threadId: s.threadId}};
         }
+        // Selecting a room must not try to reopen its unresolved process before the user can stop it.
+        const reconnectOfflineCodex = s.status === 'offline' && usesCodexCore(s.provider);
+        if (!configure && !reconnectOfflineCodex && (s.backgroundWork || (s.workers ?? []).some(ownedCommand)))
+          return {controller: existing, result: {threadId: s.threadId}};
         let recover = s.workerConnection === 'failed' || ['offline', 'error', 'uncertain'].includes(s.status);
         if (s.browserAccess?.enabled && !s.busy && !s.questions?.length) {
           try {
@@ -1383,12 +1394,17 @@ export function createConversationController({
     },
     async backgroundCommands() {
       let count = 0;
+      const unconfirmedRooms = [];
       for (const controller of controllers) {
-        count += (projected(controller).workers ?? []).filter(
-          worker => worker.kind === 'command' && !workerEnded(worker) && worker.executionUnowned !== true
-        ).length;
-        if (controller.backgroundCommands) count += await controller.backgroundCommands();
+        try {
+          const terminals = (await controller.backgroundCommands?.()) ?? 0;
+          const s = controller.state;
+          count += Math.max(terminals + (s.workers ?? []).filter(ownedCommand).length, s.backgroundWork ? 1 : 0);
+        } catch {
+          unconfirmedRooms.push(activity(controller));
+        }
       }
+      if (unconfirmedRooms.length) throw Object.assign(Error('部分聊天室的背景命令狀態未確認。'), {unconfirmedRooms});
       return count;
     },
     get discussionBusy() {
@@ -1463,7 +1479,12 @@ export function createConversationController({
       onChange();
       try {
         const {controller, result} = await operation.promise;
-        if (request === navigationRequest && !closing) active = controller;
+        if (request === navigationRequest && !closing) {
+          active = controller;
+          const s = controller.state;
+          if (data.threadId && usesCodexCore(s.provider) && !s.busy)
+            void Promise.resolve().then(() => controller.backgroundCommands?.()).catch(() => {});
+        }
         openedOrder.set(controller, ++openSequence);
         releasing = releasing.then(releaseIdleRooms);
         return request === navigationRequest ? result : {...result, superseded: true};
@@ -1874,6 +1895,23 @@ export function createConversationController({
       }
       onChange();
       return {cancelled: true};
+    }
+    if (data?.backgroundOnly === true) {
+      const c = target(data);
+      const beforeStop = () => {
+        const s = activity(c);
+        if (rooms.get(data.threadId) !== c || s.threadId !== data.threadId || s.busy ||
+            discussion(c)?.held || continuations.has(c) || (!s.backgroundWork && !s.pendingWorkers))
+          throw Error('聊天室工作狀態已改變，請重新確認後再停止。');
+      };
+      beforeStop();
+      locked.add(c);
+      try {
+        return await c.stop(beforeStop);
+      } finally {
+        locked.delete(c);
+        onChange();
+      }
     }
     const source = rooms.get(data?.threadId),
       pending = source && continuations.get(source);

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import {mkdir, mkdtemp, readFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, writeFile} from 'node:fs/promises';
 import {randomUUID} from 'node:crypto';
 import {createGeminiController} from '../src/gemini-controller.mjs';
 import {geminiToolGuidance} from '../src/gemini-worker.mjs';
@@ -131,6 +131,52 @@ async function fixture({prompt, setup, onClose, closeFails = false, killFails = 
   };
 }
 
+test('held prompt without echo uses the native user and final reply order, never resending', async () => {
+  for (const evidence of ['matching', 'previous reply', 'missing']) {
+    const f = await fixture({
+      async prompt({number, command, complete, echo, text, params}) {
+        if (number === 1) {
+          echo('first');
+          command();
+          text('first answer');
+        } else {
+          complete();
+          command('new');
+          complete('new');
+          text('answer to the note');
+          if (evidence !== 'missing') {
+            const logs = path.join(f.root, 'agent-home/gemini/main', f.c.state.threadId, '.gemini/antigravity-cli/brain', params.sessionId, '.system_generated/logs');
+            await mkdir(logs, {recursive: true});
+            const created_at = new Date(Math.floor(Date.now()/1000)*1000).toISOString();
+            const question = {type: 'USER_INPUT', source: 'USER_EXPLICIT', status: 'DONE', created_at, content: '<USER_REQUEST>\nread the note\n</USER_REQUEST>'};
+            const answer = {type: 'PLANNER_RESPONSE', source: 'MODEL', status: 'DONE', content: 'answer to the note'};
+            const rows = evidence === 'matching' ? [question, answer] : [answer, question];
+            await writeFile(path.join(logs, 'transcript_full.jsonl'), rows.map(r => JSON.stringify(r)).join('\n'));
+          }
+        }
+        return {stopReason: 'end_turn'};
+      }
+    });
+    try {
+      await f.send('first');
+      await f.send('read the note');
+      assert.equal(f.requests.filter(r => r.method === 'session/prompt').length, 2);
+      const {status, messages, error} = f.c.state;
+      if (evidence === 'matching') {
+        assert.equal(status, 'completed');
+        assert.deepEqual(messages.slice(-2).map(m => m.text), ['read the note', 'answer to the note']);
+        assert.ok(messages.at(-1).completedAt && !messages.at(-1).partial && !messages.at(-1).streaming);
+      } else {
+        assert.equal(status, 'failed');
+        assert.match(error, /未能確認/);
+        assert.ok(messages.at(-2).partial && !messages.at(-2).completedAt);
+      }
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
 test('reply before native command completion keeps process and lease; next prompt drains old result without resume or replay', async () => {
   const f = await fixture({
     prompt({number, text, echo, command, complete}) {
@@ -186,6 +232,49 @@ test('reply before native command completion keeps process and lease; next promp
     );
     assert.equal(saved.tools[0].status, 'completed');
     assert.equal(saved.messages[2].completedAt, f.c.state.messages[2].completedAt);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('a terminal tool ID stays settled after metadata and out-of-order progress', async () => {
+  const statuses = {completed: 'completed', failed: 'failed', error: 'failed', cancelled: 'cancelled', canceled: 'cancelled'};
+  for (const [native, expected] of Object.entries(statuses)) {
+    const f = await fixture({
+      prompt({command, complete, update}) {
+        command('same');
+        complete('same', native);
+        update({sessionUpdate: 'tool_call_update', toolCallId: 'same', title: 'metadata'});
+        command('same');
+        return {stopReason: 'end_turn'};
+      }
+    });
+    try {
+      await f.send();
+      assert.equal(f.c.state.tools[0].status, expected, native);
+      assert.equal(f.c.backgroundWork, null);
+      assert.equal(f.c.state.workers.length, 0);
+      assert.deepEqual(f.released, [{settled: true, refresh: true}]);
+    } finally {
+      await f.cleanup();
+    }
+  }
+});
+
+test('a different tool ID cannot settle a held command; a late terminal event settles only its row', async () => {
+  const f = await fixture();
+  try {
+    await f.send();
+    f.complete('different');
+    assert.equal(f.c.state.workers[0].settled, false);
+    f.complete('slow', 'canceled');
+    assert.equal(f.c.state.workers[0].settled, true);
+    assert.equal(f.c.state.workers[0].status, 'cancelled');
+    assert.equal(f.c.backgroundWork, 'agy 背景程序保留中');
+    assert.equal(f.released.length, 0);
+    assert.deepEqual(await f.c.stop(), {stopped: true});
+    assert.equal(f.c.backgroundWork, null);
+    assert.deepEqual(f.released, [{settled: true, refresh: true}]);
   } finally {
     await f.cleanup();
   }
@@ -295,7 +384,8 @@ test('unconfirmed held stop remains unresolved and close cannot report offline; 
   const f = await fixture({closeFails: true, killFails: true});
   try {
     await f.send();
-    await f.c.stop();
+    assert.deepEqual(await f.c.stop(), {stopped: false});
+    assert.equal(f.c.backgroundWork, 'Gemini 程序停止待確認');
     assert.equal(f.c.state.status, 'uncertain');
     assert.equal(f.c.state.workers[0].settled, false);
     assert.equal(f.c.state.workers[0].status, 'unresolved');
@@ -305,10 +395,27 @@ test('unconfirmed held stop remains unresolved and close cannot report offline; 
     assert.equal(f.c.state.status, 'uncertain');
     f.allowKill();
     await f.c.stop();
+    assert.equal(f.c.backgroundWork, null);
     assert.deepEqual(f.killed, [3100, 3100]);
     assert.equal(f.c.state.workers[0].settled, true);
     assert.match(f.c.state.workers[0].output, /已停止/);
     assert.doesNotMatch(f.c.state.workers[0].output, /停止尚未確認/);
+  } finally {
+    await f.cleanup();
+  }
+});
+
+test('retry after an unconfirmed held stop never kills a PID whose original process has since exited', async () => {
+  const f = await fixture({closeFails: true, killFails: true});
+  try {
+    await f.send();
+    assert.deepEqual(await f.c.stop(), {stopped: false});
+    f.agents[0].end();
+    assert.deepEqual(await f.c.stop(), {stopped: true});
+    assert.deepEqual(f.killed, []);
+    assert.equal(f.c.backgroundWork, null);
+    assert.equal(f.c.state.workers[0].settled, true);
+    assert.deepEqual(f.released, [{settled: false, refresh: true}]);
   } finally {
     await f.cleanup();
   }

@@ -1510,7 +1510,8 @@ test('stop() unblocks hung pre-prompt init RPCs (session/new, session/set_model)
         c.stop(),
         new Promise((_, reject) => setTimeout(() => reject(Error(`stop() hung at ${hangOn}`)), 2000))
       ]);
-      assert.deepEqual(stopResult, {stopped: true});
+      assert.deepEqual(stopResult, {stopped: false});
+      assert.equal(c.backgroundWork, 'Gemini 程序停止待確認');
       assert.equal(c.state.busy, false);
       assert.equal(c.state.status, 'uncertain');
       assert.equal(released.length, 1);

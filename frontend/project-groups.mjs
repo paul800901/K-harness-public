@@ -29,6 +29,7 @@ export function activitySessions(projects, sessions, conversationActivity = [], 
         activity.busy ||
         pendingQuestionCount(activity) > 0 ||
         activity.pendingWorkers > 0 ||
+        activity.backgroundWork ||
         unreadIds.has(session.threadId)
       );
     })

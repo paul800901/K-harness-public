@@ -63,7 +63,7 @@
 .sidebar .self-update-button{width:100%;min-width:0;display:inline-flex;align-items:center;justify-content:center;min-height:30px;padding:4px 10px;border-radius:var(--k-radius-sm);background:var(--k-ink);color:var(--k-sheet);border:1px solid var(--k-ink);font-size:var(--k-text-md);font-weight:700;cursor:pointer;white-space:nowrap}
 .sidebar .self-update-button:hover:not(:disabled){opacity:.88}
 .sidebar .self-update-button:disabled{opacity:.5;cursor:default}
-.sidebar .self-update-notice{font-size:var(--k-text-xs);color:var(--k-ink-2);margin-top:5px;padding:0 4px;line-height:1.4;word-break:break-all}
+.sidebar .self-update-notice{font-size:var(--k-text-xs);color:var(--k-ink-2);margin-top:5px;padding:0 4px;line-height:1.4;white-space:pre-line;overflow-wrap:anywhere;max-height:25vh;overflow-y:auto}
 .sidebar .self-update-failed{font-size:var(--k-text-xs);color:var(--k-danger);margin-top:5px;padding:0 4px;line-height:1.4;word-break:break-all}
 
 .sidebar-page-links{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));align-items:stretch;gap:6px;margin-bottom:10px}

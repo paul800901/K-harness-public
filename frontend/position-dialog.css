@@ -1,0 +1,40 @@
+@media (min-width: 701px) {
+  dialog.sidebar-position { width: min(440px, calc(100vw / var(--k-ui-scale) - 32px)); }
+}
+.sidebar-position .modal-head h2 {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  max-height: 3em;
+  overflow: auto;
+}
+.sidebar-position .modal-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  overflow: hidden;
+}
+.position-scope { margin: 0; color: var(--k-ink-3); font-size: var(--k-text-sm); }
+.position-actions { display: flex; gap: 8px; }
+.sidebar-position .position-actions button {
+  flex: 1;
+  min-height: 44px;
+  background: var(--k-sheet);
+  border: 1px solid var(--k-line);
+  border-radius: var(--k-radius-sm);
+}
+.sidebar-position .position-item .position-actions button { border-color: var(--k-brass-line); }
+.position-list { overflow: auto; overscroll-behavior: contain; }
+.position-item + .position-item { margin-top: 4px; }
+.sidebar-position .position-name {
+  justify-content: flex-start;
+  width: 100%;
+  min-height: 44px;
+  text-align: left;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--k-line);
+  background: var(--k-sheet);
+  border-radius: var(--k-radius-sm);
+}
+.position-name small { margin-inline-start: 8px; }
+.sidebar-position .position-name[aria-expanded="true"] { background: var(--k-brass-wash); border-color: var(--k-brass-line); }
+.position-item .position-actions { padding: 4px 0 8px; }

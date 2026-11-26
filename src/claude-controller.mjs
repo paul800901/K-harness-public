@@ -1974,6 +1974,9 @@ export function createClaudeController({
 
   return {
     state,
+    get backgroundWork() {
+      return stopUnconfirmed ? 'Claude 工作停止待確認' : null;
+    },
     async sessions() {
       const [projection, common] = await Promise.all([readRecords(root), listMainSessions(root)]);
       const visible = new Set(projection.sessions.map(item => item.threadId));

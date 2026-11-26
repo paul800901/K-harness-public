@@ -165,6 +165,28 @@ const commandCall = command => ({
   _meta: {'x.ai/tool': {name: 'run_terminal_command', label: 'Run Command'}}
 });
 
+test('Grok relocation keeps a persisted room usable when its native session cannot load from another cwd', async () => {
+  const f = await fixture([]), c = f.controller;
+  try {
+    const room = await c.open({model: 'grok-4.7', effort: 'low'});
+    await c.send({text: 'remember'});
+    await settled(c);
+    const destination = path.join(f.root, 'destination');
+    await mkdir(destination);
+    const before = structuredClone(c.state), calls = f.fake.calls.length;
+    const saved = await readFile(path.join(f.root, '.runtime/grok-sessions', `${room.threadId}.json`), 'utf8');
+    await assert.rejects(c.open({...room, model: 'grok-4.7'}, {relocation: {workspace: destination}}), /不同實體目錄/u);
+    assert.deepEqual(c.state, before);
+    assert.equal(f.fake.calls.length, calls);
+    assert.equal(await readFile(path.join(f.root, '.runtime/grok-sessions', `${room.threadId}.json`), 'utf8'), saved);
+    await c.send({text: 'continue'});
+    await settled(c);
+    assert.equal(f.fake.agents.length, 1);
+  } finally {
+    await c.close();
+  }
+});
+
 test('grok catalog, quota and environment come from native data only', () => {
   assert.deepEqual(
     MODELS.map(m => [
@@ -705,6 +727,7 @@ test('stop reaches a process whose session setup hangs, and an unconfirmed close
   assert.deepEqual(await f.controller.stop(), {stopped: true});
   assert.ok(hanging.calls.some(c => c.method === 'close'));
   assert.equal(f.controller.state.busy, false);
+  assert.equal(f.controller.backgroundWork, null);
   // A failed setup whose process cannot be confirmed stopped blocks the room until stop ends it.
   failClose = true;
   const f2 = await fixture([], {
@@ -720,6 +743,7 @@ test('stop reaches a process whose session setup hangs, and an unconfirmed close
   });
   await f2.controller.open({model: 'grok-4.7'});
   await assert.rejects(f2.controller.send({text: 'one'}), /kill failed/);
+  assert.match(f2.controller.backgroundWork, /Grok.*停止待確認/);
   await assert.rejects(f2.controller.send({text: 'two'}), /查明目前 Grok 工作/);
   failClose = false;
   await f2.controller.stop();
@@ -849,6 +873,9 @@ test('a stop during initialize whose process cannot be ended reports the PID ins
   setTimeout(() => abort.abort(), 10);
   const error = await opening.catch(e => e);
   assert.equal(error.unresolvedPid, 777);
+  assert.equal(error.unresolvedProcess.exited, false);
+  child.emit('exit', 0);
+  assert.equal(error.unresolvedProcess.exited, true);
   assert.match(error.message, /停止未確認/);
 });
 

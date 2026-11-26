@@ -119,13 +119,16 @@ export async function startDesktop({
     writesInProgress = 0;
   const updating = () => updateChecking || Date.now() - updateHandedOffAt < 180_000;
   // Everything a normal close would interrupt, from the live snapshot.
-  const selfUpdateSnapshotBusy = () => {
+  const roomName = act =>
+    [act.workspace && path.basename(act.workspace), act.title || act.threadId || '未命名聊天室'].filter(Boolean).join(' / ');
+  const selfUpdateSnapshotBusy = (rooms, includeBackground = false, gemini) => {
     const busy = [];
-    for (const act of controller.state.conversationActivity ?? []) {
-      const name = act.title || '未命名聊天室';
-      if (act.busy) busy.push(`聊天室：${name} 工作中`);
+    for (const act of rooms) {
+      const name = roomName(act);
+      if (act.busy && !(includeBackground && act.backgroundWork)) busy.push(`聊天室：${name} 工作中`);
       else if (act.pendingQuestions > 0) busy.push(`聊天室：${name} 等待確認中`);
       else if (act.pendingWorkers > 0) busy.push(`聊天室：${name} 子代理執行中`);
+      if (includeBackground && act.backgroundWork) busy.push(`聊天室：${name} ${act.backgroundWork}`);
     }
     if (controller.discussionBusy) busy.push('討論進行中');
     if (coreUpdates?.pending) busy.push('核心更新進行中');
@@ -133,6 +136,14 @@ export async function startDesktop({
     if (codexLogin.progress?.().login?.status === 'running') busy.push('Codex 登入程序執行中');
     if (grokLogin.progress?.().status === 'pending') busy.push('Grok 登入程序執行中');
     if (localDictation.busy) busy.push('語音聽寫進行中');
+    if (gemini?.checking) busy.push('Gemini 帳號額度查詢中');
+    if (gemini?.inspecting) busy.push('Gemini 原生資料查詢中');
+    if (gemini?.uncertain) busy.push('Gemini 程序或帳號狀態待確認');
+    if (gemini?.loginPending) busy.push('Gemini 帳號等待完成登入');
+    if (gemini?.changing && !gemini.checking && !gemini.loginPending) busy.push('Gemini 帳號操作中');
+    if (gemini?.busy && !(gemini.checking || gemini.inspecting || gemini.uncertain || gemini.loginPending || gemini.changing) &&
+        !rooms.some(a => a.provider === 'gemini' && (a.busy || a.backgroundWork || a.pendingWorkers)))
+      busy.push('Gemini 程序執行中');
     if (writesInProgress) busy.push('有操作正在處理');
     return busy;
   };
@@ -140,14 +151,24 @@ export async function startDesktop({
   // confirmed counts as busy.
   const selfUpdateBusy = async () => {
     const busy = [];
+    let count = 0;
+    let gemini;
     try {
-      const gemini = await geminiAccounts?.list?.();
-      if (gemini?.busy || gemini?.checking || gemini?.loginPending || officialGeminiAccount.busy) busy.push('Gemini 程序執行中');
-      if ((await controller.backgroundCommands?.()) > 0) busy.push('背景命令執行中');
-    } catch {
-      busy.push('部分工作狀態無法確認');
+      count = await controller.backgroundCommands?.();
+    } catch (error) {
+      if (error.unconfirmedRooms?.length) {
+        for (const act of error.unconfirmedRooms) busy.push(`聊天室：${roomName(act)} ${act.backgroundWork || '背景命令狀態待確認'}`);
+      } else busy.push('部分工作狀態無法確認');
     }
-    return [...busy, ...selfUpdateSnapshotBusy()];
+    try {
+      gemini = await geminiAccounts?.list?.();
+    } catch {
+      busy.push('Gemini 帳號狀態待確認');
+    }
+    if (officialGeminiAccount.busy) busy.push('Gemini 官方登入或帳號操作中');
+    const rooms = controller.state.conversationActivity ?? [];
+    if (count > 0 && !rooms.some(a => a.backgroundWork)) busy.push('背景命令執行中');
+    return [...new Set([...selfUpdateSnapshotBusy(rooms, true, geminiAccounts?.activity ?? gemini), ...busy])];
   };
   let pickerAbort = null;
   // A native login expiry in a main room starts the official sign-in in the owner's
@@ -781,8 +802,10 @@ export async function startDesktop({
         if (!ref) return json(409, {error: '目前沒有可更新的版本。'});
         // Obvious work is refused at once; otherwise the update is reserved before the first await, so a
         // second press and any new work are refused until the hand-off.
-        let busy = selfUpdateSnapshotBusy();
-        if (busy.length) return json(409, {error: '還有工作在跑，等結束再按。', busy});
+        const rooms = controller.state.conversationActivity ?? [];
+        let busy = selfUpdateSnapshotBusy(rooms, false, geminiAccounts?.activity);
+        if (busy.length)
+          return json(409, {error: '還有工作在跑，等結束再按。', busy: selfUpdateSnapshotBusy(rooms, true, geminiAccounts?.activity)});
         updateChecking = true;
         try {
           busy = await selfUpdateBusy();
@@ -1046,6 +1069,8 @@ export async function startDesktop({
         '/api/native/review': 'review',
         '/api/native/files/search': 'fuzzyFileSearch'
       };
+      if (url.pathname === '/api/stop' && data?.backgroundOnly === true && !controller.concurrentConversations)
+        throw Error('此連線無法驗證指定房間的背景停止要求。');
       if (routes[url.pathname])
         return json(
           200,

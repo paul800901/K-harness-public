@@ -136,6 +136,13 @@ test('connection, retry, user confirmation and terminal states override a generi
   assert.match(workStatus({...f.state, busy: false, status: 'failed'}, true, f.now).text, /工作失敗/);
 });
 
+test('the room shows held background work independently of the child-agent count', () => {
+  const state = {status: 'completed', backgroundWork: 'agy 背景程序保留中', workers: [{kind: 'command', status: 'running'}]};
+  assert.equal(workStatus(state).text, '主代理待命 · agy 背景程序保留中');
+  assert.equal(workStatus({...state, backgroundWork: null}), null);
+  assert.match(workStatus({...state, questions: [{}]}).text, /等待你的確認.*agy/);
+});
+
 test('unowned Gemini history is visible but never counted as current work or reported stopped', () => {
   const old = {conversationId: 'a', provider: 'gemini', status: 'unresolved', settled: false, executionUnowned: true};
   const live = {conversationId: 'a', provider: 'codex', status: 'running', settled: false};

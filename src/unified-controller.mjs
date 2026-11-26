@@ -170,10 +170,14 @@ export function createUnifiedController(options) {
     }
   });
   const api = {
+    async backgroundCommands() {
+      return active.backgroundCommands?.() ?? 0;
+    },
     get state() {
       return {
         ...active.state,
         ...queue.state,
+        backgroundWork: active.backgroundWork ?? active.state.backgroundWork ?? null,
         roomNotes: roomNotes?.pending(active.state.threadId) ?? [],
         provider:
           active === codex
@@ -481,7 +485,12 @@ export function createUnifiedController(options) {
         const next = await validateWorkspace(workspace);
         const saved = (await listMainSessions(root, {threadId})).sessions[0];
         if (!saved) throw Error('找不到聊天室紀錄。');
-        if (next.toLowerCase() === saved.workspace.toLowerCase()) return {threadId, workspace: next};
+        if (next.toLowerCase() === saved.workspace.toLowerCase()) {
+          // The project list uses case-insensitive keys. A key match alone cannot identify a directory.
+          if (next !== saved.workspace && next !== (await validateWorkspace(saved.workspace)))
+            throw Error('工作區清單將這兩個不同實體目錄視為同名，無法移動聊天室。');
+          return {threadId, workspace: next};
+        }
         const workers = await active.workers();
         if (
           workers.some(w => w.settled === false || ['running', 'starting', 'pending', 'unresolved'].includes(w.status))
@@ -789,9 +798,10 @@ export function createUnifiedController(options) {
     if (changing) throw Error('正在切換對話。');
     return queue.action(data);
   };
-  api.stop = async () => {
+  api.stop = async beforeStop => {
     stopEpoch++;
     await queue.pause();
+    if (typeof beforeStop === 'function') beforeStop();
     return active.stop();
   };
   api.selectWorkspace = async data => {

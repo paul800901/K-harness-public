@@ -742,25 +742,121 @@ export function useTouchSelectionGuard() {
   useEffect(() => {
     if (!/Android/i.test(navigator.userAgent)) return;
     let last = null;
+    // The updated shell asks us to commit just before a native command reads the
+    // selection. Leave the native range alone during the gesture so WebView keeps
+    // ownership of the moving handle, including when the other end leaves the screen.
+    const defer = window.KApp?.selectionCommandHook?.() && window.CSS?.highlights && window.Highlight;
+    const clearHighlight = () => {
+      if (!defer) return;
+      CSS.highlights.delete('k-chat-selection');
+      document.documentElement.classList.remove('chat-selection-repaired');
+    };
+    const reset = () => {
+      clearHighlight();
+      document.documentElement.classList.remove('chat-selection-active');
+      last = null;
+    };
     const inViewport = node => !!(node?.nodeType === 1 ? node : node?.parentElement)?.closest('.viewport'),
       // React may have shortened or moved the remembered node since.
       usable = (node, offset) =>
         inViewport(node) && offset <= (node.nodeType === 3 ? node.length : node.childNodes.length);
-    const guard = () => {
+    const guard = (commit = false) => {
       const selected = window.getSelection();
-      if (!selected || selected.isCollapsed) return void (last = null);
+      if (!selected || selected.isCollapsed) {
+        reset();
+        return;
+      }
       const {anchorNode, anchorOffset, focusNode, focusOffset} = selected,
         anchorIn = inViewport(anchorNode),
         focusIn = inViewport(focusNode);
-      if (anchorIn && focusIn) return void (last = {anchorNode, anchorOffset, focusNode, focusOffset});
-      if (last && !anchorIn && focusIn && usable(last.anchorNode, last.anchorOffset))
-        selected.setBaseAndExtent(last.anchorNode, last.anchorOffset, focusNode, focusOffset);
-      else if (last && anchorIn && !focusIn && usable(last.focusNode, last.focusOffset))
-        selected.setBaseAndExtent(anchorNode, anchorOffset, last.focusNode, last.focusOffset);
-      else last = null;
+      if (anchorIn && focusIn) {
+        clearHighlight();
+        if (defer) document.documentElement.classList.add('chat-selection-active');
+        const r = selected.getRangeAt(0);
+        last = defer
+          ? {start: r.startContainer, startOffset: r.startOffset, end: r.endContainer, endOffset: r.endOffset}
+          : {start: anchorNode, startOffset: anchorOffset, end: focusNode, endOffset: focusOffset};
+        return;
+      }
+      // WebView may reverse anchor/focus on re-grip. Choose the remembered end
+      // by document order, independent of which native handle was picked up.
+      const startEscaped = defer ? !inViewport(selected.getRangeAt(0).startContainer) : !anchorIn;
+      const fixed = startEscaped ? last?.start : last?.end;
+      const offset = startEscaped ? last?.startOffset : last?.endOffset;
+      if (!last || !usable(last.start, last.startOffset) || !usable(last.end, last.endOffset)) {
+        reset();
+        return;
+      }
+      if (!anchorIn && !focusIn) {
+        const held = defer && CSS.highlights.get('k-chat-selection');
+        const viewport = (last.start.nodeType === 1 ? last.start : last.start.parentElement).closest('.viewport');
+        if (!held || !selected.getRangeAt(0).intersectsNode(viewport)) reset();
+        else if (commit) {
+          const range = [...held][0];
+          selected.setBaseAndExtent(range.startContainer, range.startOffset, range.endContainer, range.endOffset);
+          clearHighlight();
+          return selected.toString();
+        }
+        return;
+      }
+      const base = anchorIn ? anchorNode : fixed, baseOffset = anchorIn ? anchorOffset : offset;
+      const end = focusIn ? focusNode : fixed, endOffset = focusIn ? focusOffset : offset;
+      if (!defer || commit) {
+        clearHighlight();
+        selected.setBaseAndExtent(base, baseOffset, end, endOffset);
+        return commit ? selected.toString() : undefined;
+      }
+      const range = document.createRange();
+      range.setStart(base, baseOffset);
+      range.collapse(true);
+      if (range.comparePoint(end, endOffset) < 0) range.setStart(end, endOffset);
+      else range.setEnd(end, endOffset);
+      const moving = anchorIn ? anchorNode : focusNode, movingOffset = anchorIn ? anchorOffset : focusOffset;
+      const moved = startEscaped ? moving !== last.end || movingOffset !== last.endOffset
+        : moving !== last.start || movingOffset !== last.startOffset;
+      if (startEscaped) {
+        last.end = moving;
+        last.endOffset = movingOffset;
+      } else {
+        last.start = moving;
+        last.startOffset = movingOffset;
+      }
+      CSS.highlights.set('k-chat-selection', new Highlight(range));
+      document.documentElement.classList.add('chat-selection-repaired');
+      if (moved) {
+        const viewport = (moving.nodeType === 1 ? moving : moving.parentElement).closest('.viewport');
+        const point = document.createRange();
+        point.setStart(moving, movingOffset);
+        point.collapse(true);
+        const rect = point.getBoundingClientRect(), bounds = viewport.getBoundingClientRect();
+        if (rect.height && rect.top < bounds.bottom && rect.bottom > bounds.top) {
+          if (startEscaped && rect.bottom >= bounds.bottom - rect.height) viewport.scrollTop += rect.height;
+          if (!startEscaped && rect.top <= bounds.top + rect.height) viewport.scrollTop -= rect.height;
+        }
+      }
     };
-    document.addEventListener('selectionchange', guard);
-    return () => document.removeEventListener('selectionchange', guard);
+    const changed = () => guard(), commit = () => guard(true);
+    const read = event => {
+      if (defer) event.detail.text = commit();
+    };
+    const key = event => {
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'a') reset();
+    };
+    document.addEventListener('selectionchange', changed);
+    window.addEventListener('k-read-selection', read);
+    window.addEventListener('k-select-all', reset);
+    document.addEventListener('keydown', key);
+    window.addEventListener('k-add-selection', commit, true);
+    document.addEventListener('copy', commit, true);
+    return () => {
+      reset();
+      document.removeEventListener('selectionchange', changed);
+      window.removeEventListener('k-read-selection', read);
+      window.removeEventListener('k-select-all', reset);
+      document.removeEventListener('keydown', key);
+      window.removeEventListener('k-add-selection', commit, true);
+      document.removeEventListener('copy', commit, true);
+    };
   }, []);
 }
 export function AddResponseSelectionButton({onAdd, disabled}) {

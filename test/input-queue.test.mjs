@@ -931,3 +931,25 @@ for (const busy of [true, false])
       await queue.close();
     }
   });
+
+test('queued effort survives reopening and starts a new turn with the selected level', async () => {
+  const base = await root(), sent = [];
+  const active = controller({busy: true, send: input => sent.push(input)});
+  active.state.effort = 'xhigh';
+  let queue = queueFor(base, active);
+  try {
+    await queue.load(active.state.threadId);
+    const row = await queue.enqueue({text: 'next', effort: 'high'}, {steer: true});
+    assert.equal(row.queued, true);
+    await queue.close();
+    queue = queueFor(base, active);
+    await queue.load(active.state.threadId);
+    await assert.rejects(queue.action({id: row.id, action: 'send-now'}), /推理程度/);
+    assert.deepEqual(active.calls, []);
+    Object.assign(active.state, {busy: false, status: 'ready'});
+    await queue.action({id: row.id, action: 'send-now'});
+    assert.deepEqual(sent, [{text: 'next', attachmentIds: [], effort: 'high'}]);
+  } finally {
+    await queue.close();
+  }
+});

@@ -1,21 +1,21 @@
 import React, {useEffect, useState} from 'react';
 import {workStatus, currentWorkers, workerEnded, workerHealth, statusLabel} from './work-status.mjs';
 
-export function WorkStatus({state, online, connecting = false, loginRequired = false, footer = false}) {
+export function WorkStatus({state, online, connecting = false, loginRequired = false, footer = false, onStopBackground, stopDisabled}) {
   const [now, setNow] = useState(Date.now);
-  const pending = currentWorkers(state).some(w => !workerEnded(w));
+  const pending = currentWorkers(state).filter(w => !workerEnded(w));
   useEffect(() => {
-    if (!state.busy && state.status !== 'working' && !pending) return;
+    if (!state.busy && state.status !== 'working' && !pending.length) return;
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, [state.threadId, state.busy, state.status, pending]);
+  }, [state.threadId, state.busy, state.status, pending.length]);
   const status =
     loginRequired && !connecting
       ? {kind: 'waiting', text: '手機登入已失效 · 工作狀態待確認'}
       : connecting
         ? {kind: 'waiting', text: '正在同步電腦狀態 · 尚未確認工作狀態'}
         : workStatus(state, online, Math.max(now, Date.now()));
-  if (!status || (footer && !state.busy && state.status !== 'working' && !pending && !state.completionPending))
+  if (!status || (footer && !state.busy && state.status !== 'working' && !pending.length && !state.backgroundWork && !state.completionPending))
     return null;
   return (
     <span
@@ -26,6 +26,11 @@ export function WorkStatus({state, online, connecting = false, loginRequired = f
     >
       <i />
       <span>{status.text}</span>
+      {onStopBackground && !state.busy && !state.discussion?.busy && !state.discussion?.held &&
+        (state.backgroundWork || pending.some(w => !w.executionUnowned)) && (
+        <button type="button" className="stop-background" disabled={stopDisabled || !online} onClick={onStopBackground}
+          title="停止這個聊天室的背景程序與未結束的子代理">停止本房背景工作</button>
+      )}
     </span>
   );
 }

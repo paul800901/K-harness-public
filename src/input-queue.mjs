@@ -108,13 +108,18 @@ export function createInputQueue({
         (immediate && s.busy && s.capabilities?.steer === false)
       )
         throw Error('送出前對話狀態已改變；訊息保留排隊。');
+      if (immediate && s.busy && row.effort && row.effort !== s.effort)
+        throw Error('這則待送訊息指定了不同的推理程度，請等目前回合結束再送出。');
       attempted = true;
-      const input = {text: row.text, attachmentIds: row.attachmentIds ?? []};
+      const input = {
+        text: row.text,
+        attachmentIds: row.attachmentIds ?? [],
+        ...(row.effort ? {effort: row.effort} : {})
+      };
       const canDeliver = automatic
         ? () => !closed && epoch === stopEpoch && threadId === id && getController() === c && c.state.threadId === id
         : undefined;
-      result =
-        immediate && s.busy && !automatic ? await c.steer(input) : await send(c, input, canDeliver);
+      result = immediate && s.busy && !automatic ? await c.steer(input) : await send(c, input, canDeliver);
       if (result?.sent === false) {
         const error = Error('訊息未送出，請查明停止狀態。');
         error.notSent = true;
@@ -166,7 +171,7 @@ export function createInputQueue({
       closed = false;
       notify();
     },
-    async enqueue({text = '', attachmentIds = []}, {steer = false} = {}) {
+    async enqueue({text = '', attachmentIds = [], effort}, {steer = false} = {}) {
       if (
         typeof text !== 'string' ||
         text.length > 32000 ||
@@ -179,8 +184,16 @@ export function createInputQueue({
       const owner = getController(),
         epoch = stopEpoch,
         pausedAtStart = paused,
-        automatic = steer && !(paused && rows.length) && canSteer(owner.state);
-      const row = {id: randomUUID(), text, attachmentIds, createdAt: new Date().toISOString(), status: 'queued'};
+        automatic =
+          (!effort || effort === owner.state.effort) && steer && !(paused && rows.length) && canSteer(owner.state);
+      const row = {
+        id: randomUUID(),
+        text,
+        attachmentIds,
+        ...(effort ? {effort} : {}),
+        createdAt: new Date().toISOString(),
+        status: 'queued'
+      };
       rows.push(row);
       await save(() => {
         rows = rows.filter(r => r !== row);

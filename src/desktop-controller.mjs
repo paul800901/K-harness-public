@@ -358,6 +358,7 @@ export function createDesktopController({
     return metadata;
   };
   let settlingWorkers = 0,
+    terminalRead = 0,
     nativeCompletionVersion = 0;
   const changed = () => {
     state.completionPending =
@@ -683,8 +684,13 @@ export function createDesktopController({
       }
       if (['turn/started', 'turn/completed', 'thread/status/changed'].includes(e.method))
         void workers()
-          .then(() => deliverFlashResults())
+          .then(() => {
+            if (e.method === 'turn/completed' && !stopping && !closing) void backgroundCommands().catch(() => {});
+            return deliverFlashResults();
+          })
           .catch(() => {});
+      if (!stopping && !closing && e.method === 'item/completed' && p.item?.type === 'commandExecution' && childActivities.get(p.threadId)?.ended)
+        void backgroundCommands().catch(() => {});
       return;
     }
     if (
@@ -943,6 +949,8 @@ export function createDesktopController({
         groupId: activeGroupId
       });
       if (i.type === 'fileChange') syncArtifacts();
+      if (!state.busy && !opening && !stopping && !closing && i.type === 'commandExecution' && e.method === 'item/completed')
+        void backgroundCommands().catch(() => {});
       if (['subAgentActivity', 'collabAgentToolCall'].includes(i.type)) void workers().catch(() => {});
     }
     if (e.method === 'turn/completed') {
@@ -1124,6 +1132,9 @@ export function createDesktopController({
           turnId: null
         };
       settlingWorkers++;
+      if (!stopping && !closing && (state.backgroundWork || p.turn.items?.some(i => i.type === 'commandExecution') ||
+        state.tools.some(t => t.turnId === completedTurnId && t.name === 'commandExecution')))
+        void backgroundCommands().catch(() => {});
       void workers()
         .then(() => deliverFlashResults())
         .catch(e => {
@@ -2449,6 +2460,50 @@ export function createDesktopController({
     if (status === 'notLoaded') return [];
     return stopThreadTerminals(active, threadId);
   }
+  // Read the parent and its loaded, owned children, including children whose last turn ended.
+  // Late reads cannot restore a stopped terminal or put its count on a different room.
+  async function backgroundCommands() {
+    const active = host, parent = state.threadId, epoch = viewEpoch, read = ++terminalRead;
+    if (!active && state.backgroundWork) throw Error('Codex 背景命令狀態待確認，請重開原對話。');
+    if (!active || !parent) return 0;
+    const current = () => active === host && parent === state.threadId && epoch === viewEpoch && read === terminalRead;
+    const publish = label => {
+      if (label !== (state.backgroundWork ?? null)) {
+        state.backgroundWork = label;
+        changed();
+      }
+    };
+    try {
+      const count = await countTerminals(active, parent);
+      if (!current()) throw Error('聊天室背景命令狀態已改變。');
+      publish(count ? 'Codex 背景命令未結束' : null);
+      return count;
+    } catch (error) {
+      if (current()) publish('Codex 背景命令狀態待確認');
+      throw error;
+    }
+  }
+  async function countTerminals(active, parent) {
+    const ids = new Set([parent]);
+    for (const worker of state.workers)
+      if (worker.provider === 'codex' && isNativeWorker(worker) && worker.threadId && !worker.executionUnowned)
+        ids.add(worker.threadId);
+    const loaded = new Set(), cursors = new Set();
+    let cursor;
+    do {
+      const page = await active.request('thread/loaded/list', cursor ? {cursor} : {});
+      if (!Array.isArray(page?.data) || page.data.some(id => typeof id !== 'string'))
+        throw Error('原生已載入對話清單未確認。');
+      for (const id of page.data) loaded.add(id);
+      cursor = page.nextCursor;
+      if (cursor && (typeof cursor !== 'string' || cursors.has(cursor))) throw Error('原生已載入對話清單未完成。');
+      if (cursor) cursors.add(cursor);
+    } while (cursor);
+    let count = 0;
+    for (const id of ids)
+      if (loaded.has(nativeId(id))) count += (await listTerminals(active, id)).length;
+    return count;
+  }
   async function pauseNativeGoal() {
     if (!host || !state.threadId || !(state.goal?.status === 'active' || state.goalError)) return;
     try {
@@ -2474,6 +2529,7 @@ export function createDesktopController({
     requestEpoch++;
     clearNativeResults();
     try {
+      if (!host && state.backgroundWork) throw Error('Codex 連線已中斷，請重開原對話確認背景命令。');
       clearQuestions();
       if (submission) await submission;
       await pauseNativeGoal();
@@ -2493,6 +2549,8 @@ export function createDesktopController({
         throw new Error('子代理尚未確認停止。');
       await closeFlashBridge();
       if (state.goalError) throw Error(state.goalError);
+      terminalRead++;
+      state.backgroundWork = null;
       if (goalRecovery?.attempted && !goalRecovery.turnId && !turnId && !flashDeliveryUncertain) goalRecovery = null;
       markAssistantPartial(turnId);
       state.status = 'interrupted';
@@ -2629,24 +2687,7 @@ export function createDesktopController({
   return {
     state,
     sessions: () => listMainSessions(root),
-    // Native background terminals outlive the turn (also those of native subagents whose last turn
-    // already finished) and would be stopped by closing K. Same reading as goal recovery.
-    backgroundCommands: async () => {
-      if (!host || !state.threadId) return 0;
-      const page = await host.request('thread/loaded/list', {});
-      if (!Array.isArray(page.data) || page.data.some(id => typeof id !== 'string') || page.nextCursor)
-        throw Error('原生已載入對話清單未確認。');
-      const loaded = new Set(page.data);
-      let count = 0;
-      for (const id of [
-        state.threadId,
-        ...state.workers
-          .filter(w => w.provider === 'codex' && isNativeWorker(w) && w.threadId && loaded.has(nativeId(w.threadId)))
-          .map(w => w.threadId)
-      ])
-        count += (await listTerminals(host, id)).length;
-      return count;
-    },
+    backgroundCommands,
     workers,
     stop,
     usage,
@@ -2764,6 +2805,7 @@ export function createDesktopController({
         await closeBrowser();
         Object.assign(state, {
           workspace,
+          backgroundWork: null,
           threadId: null,
           model: null,
           modelDisplayName: null,
@@ -3278,6 +3320,7 @@ export function createDesktopController({
                 markAssistantPartial(turnId);
                 releaseColab();
                 host = null;
+                if (state.backgroundWork) state.backgroundWork = 'Codex 背景命令狀態待確認';
                 hostEpoch++;
                 clearNativeResults();
                 if (!opening && !closing) {
@@ -3381,6 +3424,7 @@ export function createDesktopController({
           items.clear();
           inheritedWorkerItems.clear();
           childActivities.clear();
+          state.backgroundWork = null;
           state.tools = [];
           state.workers = [];
           state.artifacts = [];
@@ -4160,6 +4204,7 @@ export function createDesktopController({
         await closeBrowser();
         await uiTimingWrite;
         state.status = 'offline';
+        state.backgroundWork = null;
         state.busy = false;
         changed();
       } finally {

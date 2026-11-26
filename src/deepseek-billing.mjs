@@ -168,35 +168,46 @@ export async function dshSessionState(home, nativeSessionId, {afterSeq = -Infini
   const text = await sessionLog(home, nativeSessionId);
   if (text === null) return null;
   let open = false,
-    queued = false,
     openAt = -1,
-    queuedAt = -1,
     lastSeq = -1,
-    goal = null;
+    goal = null,
+    rounds = 0,
+    goalRound;
+  // Keep each pending entry's insertion sequence so a later removal cannot revive work from
+  // a previous process. DSH logs normalized array splices, including claims and cancellations.
+  const nextTurn = [];
   const jobs = new Map();
-  for (const event of events(text, ['"turn/', '"agent/inbox/spliced"', '"goal/change"', '"job/'])) {
+  for (const event of events(text, ['"turn/', '"agent/inbox/spliced"', '"goal/change"', '"user/message"', '"job/'])) {
     const data = event.data ?? {};
     const at = Number.isFinite(event.seq) ? event.seq : -1;
     if (event.type === 'turn/start') {
       open = true;
       openAt = at;
-      queued = false;
+      goalRound = undefined;
+      // An unindexed queue indication has no explicit claim. Indexed DSH entries remain until spliced out.
+      if (nextTurn[0]?.unindexed) nextTurn.shift();
     } else if (event.type === 'turn/end') open = false;
-    else if (event.type === 'agent/inbox/spliced' && data.target === 'next-turn' && data.inserted?.length && !open) {
-      queued = true;
-      queuedAt = at;
-    }
-    else if (event.type === 'goal/change')
-      goal =
-        data.operation === 'clear' || !data.goal
-          ? null
-          : {
-              objective: String(data.goal.objective ?? ''),
-              status: String(data.goal.phase ?? 'unknown'),
-              rounds: Number(data.roundsStarted) || 0,
-              maxRounds: Number(data.goal.maxGoalRounds) || null
-            };
-    else if (event.type === 'job/registered' && data.jobId)
+    else if (event.type === 'agent/inbox/spliced' && data.target === 'next-turn') {
+      const entry = {at, unindexed: data.start === undefined};
+      nextTurn.splice(data.start ?? 0, data.removedCount ?? 0, ...(data.inserted ?? []).map(() => entry));
+    } else if (event.type === 'goal/change') {
+      goal = data.operation === 'clear' ? null : data.goal;
+      rounds = Number(data.roundsStarted) || 0;
+    } else if (
+      event.type === 'user/message' &&
+      data.source?.kind === 'goal' &&
+      goal?.phase === 'active' &&
+      typeof goal.id === 'string' && goal.id.length > 0 &&
+      data.source.goalId === goal.id &&
+      Number.isSafeInteger(goal.revision) && goal.revision >= 1 &&
+      data.source.revision === goal.revision &&
+      Number.isSafeInteger(data.source.round) &&
+      data.source.round === rounds + 1 &&
+      data.source.round <= goal.maxGoalRounds
+    ) {
+      rounds = data.source.round;
+      if (open) goalRound = rounds;
+    } else if (event.type === 'job/registered' && data.jobId)
       jobs.set(data.jobId, {label: String(data.label ?? data.kind ?? ''), at});
     else if (event.type === 'job/settled') jobs.delete(data.jobId);
   }
@@ -214,14 +225,22 @@ export async function dshSessionState(home, nativeSessionId, {afterSeq = -Infini
   // Turns and jobs from before this process took the session were ended with their process.
   const live = [...jobs].filter(([, job]) => job.at > afterSeq);
   open &&= openAt > afterSeq;
-  queued &&= queuedAt > afterSeq;
+  const queued = nextTurn.some(entry => entry.at > afterSeq);
   return {
     lastSeq,
     running: open || queued || live.length > 0,
     open,
     queued,
     jobs: live.map(([id, job]) => ({id, label: job.label.slice(0, 200)})),
-    goal
+    goal: goal
+      ? {
+          objective: String(goal.objective ?? ''),
+          status: String(goal.phase ?? 'unknown'),
+          rounds,
+          maxRounds: Number(goal.maxGoalRounds) || null
+        }
+      : null,
+    ...(open && goalRound ? {goalRound} : {})
   };
 }
 /**

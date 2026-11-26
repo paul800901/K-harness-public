@@ -24,6 +24,7 @@ async function fixture({
   immediateFailure = false,
   startAck = null,
   onStartAckWait = null,
+  loadedPage,
   flash = false,
   reportAuthExpired,
   selfHosted
@@ -69,7 +70,7 @@ async function fixture({
         calls.push({method, p});
         if (method === 'model/list') return {data: catalog, nextCursor: null};
         if (method === 'account/read') return {account: {type: 'chatgpt'}};
-        if (method === 'thread/loaded/list') return {data: [...loadedThreads]};
+        if (method === 'thread/loaded/list') return loadedPage ? loadedPage(p) : {data: [...loadedThreads]};
         if (method === 'thread/backgroundTerminals/list') return {data: terminals[p.threadId] ?? []};
         if (method === 'thread/read')
           return {
@@ -448,6 +449,57 @@ test('ordinary Codex failures and self-hosted 401s never report subscription log
   }
 });
 
+test('Codex command events publish the actual terminal count after the room becomes idle', async () => {
+  const f = await fixture();
+  try {
+    await f.c.send({text: 'sample'});
+    const turnId = f.turns.at(-1).id, item = {type: 'commandExecution', id: 'tool', command: 'sample'};
+    f.emit('item/started', {turnId, item});
+    f.terminals.parent = [{id: 'work'}];
+    f.finish(null);
+    await settle(f.c);
+    assert.equal(f.c.state.busy, false);
+    assert.equal(f.c.state.backgroundWork, 'Codex 背景命令未結束');
+    delete f.terminals.parent;
+    f.emit('item/completed', {turnId, item});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.c.state.backgroundWork, null);
+  } finally {
+    delete f.terminals.parent;
+    await f.c.close();
+  }
+});
+
+test('a superseded or incomplete terminal read cannot clear the newer count; loaded threads can span pages', async () => {
+  let finishRead, hold = true, loop = false;
+  const f = await fixture({loadedPage: ({cursor}) => {
+    if (hold) {
+      hold = false;
+      return new Promise(resolve => { finishRead = () => resolve({data: []}); });
+    }
+    return !cursor || loop ? {data: [], nextCursor: 'page2'} : {data: ['parent']};
+  }});
+  try {
+    const older = f.c.backgroundCommands();
+    f.terminals.parent = [{id: 'still-running'}];
+    assert.equal(await f.c.backgroundCommands(), 1);
+    finishRead();
+    await assert.rejects(older, /狀態已改變/);
+    assert.equal(f.c.state.backgroundWork, 'Codex 背景命令未結束');
+    loop = true;
+    await assert.rejects(f.c.backgroundCommands(), /清單未完成/);
+    assert.equal(f.c.state.backgroundWork, 'Codex 背景命令狀態待確認');
+    loop = false;
+    delete f.terminals.parent;
+    assert.equal(await f.c.backgroundCommands(), 0);
+    assert.equal(f.c.state.backgroundWork, null);
+  } finally {
+    finishRead?.();
+    delete f.terminals.parent;
+    await f.c.close();
+  }
+});
+
 test('background commands of the room and of its finished native subagents block an update', async () => {
   const f = await fixture();
   try {
@@ -459,6 +511,10 @@ test('background commands of the room and of its finished native subagents block
     f.loadedThreads.add('child');
     f.terminals.child = [{id: 'watch'}];
     assert.equal(await f.c.backgroundCommands(), 2);
+    assert.equal(f.c.state.backgroundWork, 'Codex 背景命令未結束');
+    f.c.state.workers[0].executionUnowned = true;
+    assert.equal(await f.c.backgroundCommands(), 1, 'a detached historical child owns no terminal here');
+    f.c.state.workers[0].executionUnowned = false;
     f.loadedThreads.delete('child');
     assert.equal(await f.c.backgroundCommands(), 1, 'an unloaded subagent has no live terminal here');
   } finally {

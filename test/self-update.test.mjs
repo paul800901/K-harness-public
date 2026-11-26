@@ -89,6 +89,18 @@ async function desktop({
   return {app, call};
 }
 
+test('a single-controller connection never downgrades a room-scoped background stop to ordinary stop', async () => {
+  let stops = 0;
+  const {app, call} = await desktop({controller: {stop() { stops++; }}});
+  try {
+    const result = await call('POST', '/api/stop', JSON.stringify({threadId: 'another', backgroundOnly: true}));
+    assert.equal(result.status, 400);
+    assert.equal(stops, 0);
+  } finally {
+    await app.close();
+  }
+});
+
 test('without a tray launcher there is nothing to update and pressing is refused', async () => {
   const {app, call} = await desktop();
   try {
@@ -533,11 +545,53 @@ test('two presses at once hand off once, and no new work starts while the update
   }
 });
 
+test('updates name terminal owners and permit handoff only on an explicit idle retry', async () => {
+  const activity = [
+    {title: '第一房', workspace: 'D:/範例', provider: 'gemini', backgroundWork: 'agy 背景程序保留中'},
+    {title: '第二房', workspace: 'D:/範例', provider: 'claude', backgroundWork: 'Claude 背景命令未結束'},
+    {title: '第三房', workspace: 'D:/範例', provider: 'codex'}
+  ];
+  const requests = [], gemini = {busy: true};
+  let count = 3, unknown = false;
+  const {app, call} = await desktop({
+    root: await repo({ready: READY}), activity, gemini,
+    controller: {async backgroundCommands() {
+      if (unknown) throw Object.assign(Error('cannot list'), {unconfirmedRooms: [activity[2]]});
+      activity[2].backgroundWork = count ? 'Codex 背景命令未結束' : null;
+      return count;
+    }},
+    request: async ref => requests.push(ref)
+  });
+  try {
+    assert.deepEqual(await call('POST'), {status: 409, body: {error: '還有工作在跑，等結束再按。', busy: [
+      '聊天室：範例 / 第一房 agy 背景程序保留中',
+      '聊天室：範例 / 第二房 Claude 背景命令未結束',
+      '聊天室：範例 / 第三房 Codex 背景命令未結束'
+    ]}});
+    count = 0;
+    gemini.busy = false;
+    for (const room of activity) room.backgroundWork = null;
+    unknown = true;
+    assert.deepEqual((await call('POST')).body.busy, ['聊天室：範例 / 第三房 背景命令狀態待確認']);
+    assert.equal(requests.length, 0);
+    unknown = false;
+    assert.equal((await call('POST')).status, 200);
+    assert.equal(requests.length, 1);
+  } finally {
+    await app.close();
+  }
+});
+
 test('background commands, a discussion or an unconfirmable state count as busy', async () => {
   for (const [controller, expected, gemini] of [
     [{backgroundCommands: async () => 1}, '背景命令執行中'],
     [{discussionBusy: true}, '討論進行中'],
     [{}, 'Gemini 程序執行中', {busy: true}],
+    [{}, 'Gemini 帳號額度查詢中', {checking: true}],
+    [{}, 'Gemini 原生資料查詢中', {busy: true, inspecting: true}],
+    [{}, 'Gemini 程序或帳號狀態待確認', {busy: true, uncertain: true}],
+    [{}, 'Gemini 帳號等待完成登入', {loginPending: true}],
+    [{}, 'Gemini 帳號操作中', {busy: true, changing: true}],
     [
       {
         backgroundCommands: async () => {

@@ -2,7 +2,7 @@ import path from 'node:path';
 import {mkdir, writeFile} from 'node:fs/promises';
 import {killAcpTree, openAcpAgent} from './acp-agent.mjs';
 
-// Grok Build (grok agent stdio) speaks ACP JSON-RPC. K keeps one native process per open
+// Grok Build (grok agent --no-leader stdio) speaks ACP JSON-RPC. K keeps one native process per open
 // room; grok owns sessions, history, compaction and tools. K only presents and coordinates.
 // The launcher names the K-only home (beside CODEX_HOME / CLAUDE_CONFIG_DIR); tests fall back under root.
 export const grokHome = (root, env = {}) =>
@@ -68,10 +68,10 @@ export function grokEnvironment(source = process.env, home) {
 
 export const killGrokTree = (pid, options = {}) => killAcpTree(pid, {...options, label: 'Grok'});
 
-/** One `grok agent stdio` process; see openAcpAgent. */
+/** Each room and worker owns its process, without a shared leader; see openAcpAgent. */
 export const openGrokAgent = options =>
   openAcpAgent({
-    args: ['agent', 'stdio'],
+    args: ['agent', '--no-leader', 'stdio'],
     label: 'Grok',
     missing: '找不到 Grok Build；請在設定頁更新 Grok 核心後重開 K。',
     killTree: killGrokTree,

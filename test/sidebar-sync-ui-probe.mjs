@@ -246,8 +246,51 @@ try {
     await mobile.locator(':popover-open').getByRole('button', {name: '上移工作區', exact: true}).isDisabled(),
     true
   );
+  await mobile.locator(':popover-open').getByRole('button', {name: '移到指定位置…'}).click();
+  const sheet = mobile.locator('dialog.sidebar-position');
+  await sheet.getByRole('button', {name: '工作區A', exact: true}).click();
+  await projectsAre(pc, ['工作區C', '工作區B', '新工作區', '工作區A']);
+  await mobile.screenshot({path: path.join(output, 'phone-position.png')});
+  await mobile.setViewportSize({width: 360, height: 760});
+  await mobile.screenshot({path: path.join(output, 'phone-position-360.png')});
+  await sheet.getByRole('button', {name: '放在下方'}).click();
+  await projectsAre(pc, ['工作區B', '新工作區', '工作區A', '工作區C']);
+  await pc.getByRole('button', {name: '管理對話 D', exact: true}).click();
+  await pc.locator(':popover-open').getByRole('button', {name: '移到指定位置…'}).click();
+  await pc.screenshot({path: path.join(output, 'desktop-position.png')});
+  await pc.getByRole('dialog').getByRole('button', {name: '移到最前'}).click();
+  await orderIs(mobile, ['D', 'B', 'C', 'A']);
+  await mobile.reload();
+  await orderIs(mobile, ['D', 'B', 'C', 'A']);
+  await projectsAre(mobile, ['工作區B', '新工作區', '工作區A', '工作區C']);
   await mobile.screenshot({path: path.join(output, 'phone.png')});
   await pc.screenshot({path: path.join(output, 'desktop.png')});
+  // Search a long group from the phone; pinned and other-workspace targets stay out of the picker in flat view.
+  sessions.push(
+    ...Array.from({length: 10}, (_, i) => ({
+      threadId: 'search-' + i,
+      title: '排序測試 ' + i,
+      model: state.model,
+      workspace: root
+    })),
+    {threadId: 'pinned', title: '釘選的對話', model: state.model, workspace: root, pinned: true},
+    {threadId: 'elsewhere', title: '其他工作區的對話', model: state.model, workspace: newProject}
+  );
+  await mobile.reload();
+  await mobile.getByRole('button', {name: '展開側欄', exact: true}).click();
+  await mobile.getByRole('button', {name: '管理對話 D', exact: true}).click();
+  await mobile.locator(':popover-open').getByRole('button', {name: '移到指定位置…'}).click();
+  const search = sheet.getByRole('searchbox');
+  assert.equal(await search.evaluate(el => el === document.activeElement), false);
+  assert.equal(await sheet.getByText('釘選的對話', {exact: true}).count(), 0);
+  assert.equal(await sheet.getByText('其他工作區的對話', {exact: true}).count(), 0);
+  await search.fill('排序測試 8');
+  await sheet.getByRole('button', {name: '排序測試 8', exact: true}).click();
+  await sheet.getByRole('button', {name: '放在上方'}).click();
+  await mobile.waitForFunction(() => {
+    const ids = [...document.querySelectorAll('.session-title>span')].map(node => node.textContent);
+    return ids[ids.indexOf('排序測試 8') - 1] === 'D';
+  });
   assert.deepEqual(errors, []);
   await writeFile(
     path.join(output, 'result.json'),

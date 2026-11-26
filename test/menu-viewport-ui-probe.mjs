@@ -103,7 +103,7 @@ try {
     });
     page.setDefaultTimeout(3500);
     page.on('pageerror', e => errors.push({viewport: vp.name, error: e.message}));
-    if (vp.app) await page.addInitScript(() => (window.KApp = {nativeQuoteMenu: () => true}));
+    if (vp.app) await page.addInitScript(() => (window.KApp = {nativeQuoteMenu: () => true, selectionCommandHook: () => true}));
     // The app's native menu item dispatches k-add-selection instead of the web toolbar.
     const addSelection = () =>
       vp.app
@@ -740,18 +740,24 @@ try {
             selection.anchorNode === a && selection.anchorOffset === ao && selection.focusNode === f && selection.focusOffset === fo;
         await at(text, 2, text, 6);
         await at(header, 0, text, 8);
-        const start = is(text, 2, text, 8);
+        const read = () => {
+          const detail = {};
+          window.dispatchEvent(new CustomEvent('k-read-selection', {detail}));
+          return detail.text;
+        };
+        const deferred = window.KApp?.selectionCommandHook?.();
+        const start = deferred ? is(header, 0, text, 8) && read() === text.data.slice(2, 8) : is(text, 2, text, 8);
         await at(text, 8, text, 4);
         await at(text, 8, header, 0);
-        const end = is(text, 8, text, 4);
+        const end = deferred ? is(text, 8, header, 0) && read() === text.data.slice(4, 8) : is(text, 8, text, 4);
         const extra = document.createTextNode('合成暫存文字八個字');
-        el.append(extra);
+        el.prepend(extra);
         await at(extra, 6, text, 8);
         // Same task, so one coalesced selectionchange sees the stale offset.
         extra.data = '短';
         selection.setBaseAndExtent(header, 0, text, 8);
         await tick();
-        const stale = selection.anchorNode === header;
+        const stale = selection.anchorNode === header && read() === undefined;
         extra.remove();
         selection.removeAllRanges();
         return {start, end, stale};
@@ -759,6 +765,20 @@ try {
       const restored = guard.start && guard.end && guard.stale;
       quoteListChecks.push({viewport: vp.name, step: 'touch-selection-ends-stay-in-messages', passed: restored, guard});
       if (!restored) errors.push({viewport: vp.name, menu: 'touch-selection', reason: 'selection-end-left-messages', guard});
+      if (vp.app) {
+        await message.evaluate(el => {
+          const range = document.createRange();
+          range.selectNodeContents(el);
+          getSelection().addRange(range);
+        });
+        await page.getByRole('button', {name: '展開側欄', exact: true}).tap();
+        const close = page.getByRole('button', {name: '收合側欄', exact: true});
+        await close.waitFor({state: 'visible'});
+        if (!(await page.evaluate(() => getSelection().isCollapsed)))
+          errors.push({viewport: vp.name, reason: 'selection-over-sidebar'});
+        await close.tap();
+        await close.waitFor({state: 'hidden'});
+      }
       await page.waitForTimeout(500);
     }
     const selectStart = (touch, scrollSoon = false) =>

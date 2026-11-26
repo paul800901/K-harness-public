@@ -2,6 +2,26 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {recoveryErrorClass} from '../src/native-error-class.mjs';
 
+test('Codex spend limits and bio policy are hard stops even alongside HTTP 429', () => {
+  for (const code of [
+    'apiKeySpendLimitExceeded',
+    'projectSpendLimitExceeded',
+    'organizationSpendLimitExceeded',
+    'bioPolicy'
+  ]) {
+    assert.equal(recoveryErrorClass({message: 'x', codexErrorInfo: code}), 'hard');
+    assert.equal(recoveryErrorClass({message: 'x', codexErrorInfo: {[code]: {}}}), 'hard');
+    assert.equal(
+      recoveryErrorClass({
+        message: 'x',
+        codexErrorInfo: {responseTooManyFailedAttempts: {httpStatusCode: 429}},
+        additionalDetails: {code}
+      }),
+      'hard'
+    );
+  }
+});
+
 test('proven hard limits outrank HTTP 429', () => {
   assert.equal(recoveryErrorClass({message: 'x', codexErrorInfo: 'usageLimitExceeded'}), 'hard');
   assert.equal(

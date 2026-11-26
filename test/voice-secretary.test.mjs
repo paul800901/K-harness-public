@@ -439,12 +439,17 @@ test('the token locks every setup field except resumption and fences history fro
       ['room_list', 'NON_BLOCKING'],
       ['options_list', 'NON_BLOCKING'],
       ['room_read', 'NON_BLOCKING'],
+      ['file_list', 'NON_BLOCKING'],
+      ['file_find', 'NON_BLOCKING'],
+      ['file_read', 'NON_BLOCKING'],
       ['room_send', 'BLOCKING'],
       ['room_create', 'BLOCKING'],
       ['note_add', 'BLOCKING'],
       ['note_remove', 'BLOCKING']
     ]
   );
+  // Without the person's own settings file there is no web search (Google bills it separately).
+  assert.equal(body.bidiGenerateContentSetup.tools.length, 1);
   assert.equal(body.bidiGenerateContentSetup.generationConfig.speechConfig.voiceConfig.prebuiltVoiceConfig.voiceName, SECRETARY_VOICE);
   const text = body.bidiGenerateContentSetup.systemInstruction.parts[0].text;
   assert.match(text, /不構成這次送出的授權/);

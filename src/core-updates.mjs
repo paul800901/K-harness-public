@@ -13,6 +13,10 @@ const exec = promisify(execFile),
   names = {codex: 'Codex', claude: 'Claude Code', gemini: 'Antigravity', grok: 'Grok Build', deepseek: 'DeepSeek Harness'};
 // DeepSeek Harness ships pre-releases (0.2.1-rc.5); a pre-release sorts before its release.
 const VERSION = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?$/u;
+// Distributed with K so a clean installation also avoids a confirmed incompatible release.
+const withheldDefaults = {
+  gemini: {'1.5.17': '工作區寫入權限實測未通過：原生工具仍可寫入工作區外（2026-11-26）。'}
+};
 const selectionFile = root => path.join(root, 'selected-cores.json');
 async function readSelection(root) {
   try {
@@ -20,6 +24,24 @@ async function readSelection(root) {
   } catch (error) {
     if (error.code === 'ENOENT') return {};
     throw error;
+  }
+}
+async function readWithheldVersions(root, provider) {
+  const file = path.join(root, 'withheld-cores.json');
+  const defaults = Object.entries(withheldDefaults[provider] ?? {});
+  const isRecord = value => value !== null && typeof value === 'object' && !Array.isArray(value);
+  try {
+    const withheld = JSON.parse(await readFile(file, 'utf8'));
+    if (!isRecord(withheld)) throw Error('名單格式無效。');
+    for (const versions of Object.values(withheld)) {
+      if (!isRecord(versions)) throw Error('名單格式無效。');
+      for (const [version, reason] of Object.entries(versions))
+        if (!VERSION.test(version) || typeof reason !== 'string' || !reason.trim()) throw Error('名單格式無效。');
+    }
+    return new Map([...defaults, ...Object.entries(withheld[provider] ?? {})]);
+  } catch (error) {
+    if (error.code === 'ENOENT') return new Map(defaults);
+    throw Error(`核心略過版本名單檔讀取失敗：${file}。未下載或變更核心，請讓 AI 檢查名單檔。`, {cause: error});
   }
 }
 async function selectedFile(root, file) {
@@ -340,10 +362,26 @@ export function createCoreUpdates({
             ? await inspect(active[provider], signal, versionEnvironment(process.env, versionEnv), provider)
             : null;
         const next = await release(provider, {signal});
-        if (!VERSION.test(next.version)) throw Error('官方核心版本資料無效。');
-        if (selected[provider]?.version === next.version && selected[provider].version !== current)
+        if (typeof next.version !== 'string' || !VERSION.test(next.version)) throw Error('官方核心版本資料無效。');
+        const entry = selected[provider];
+        const withheld = await readWithheldVersions(root, provider);
+        const reason = withheld.get(next.version);
+        if (reason) {
+          let message =
+            `${names[provider]} 官方最新版 ${next.version} 已列入略過名單（${reason}），暫不更新` +
+            (current ? `；目前維持 ${current} 執行。` : '。');
+          if (entry?.version && entry.version !== current) message += `下次啟動 K 時選用 ${entry.version}。`;
+          if (withheld.has(entry?.version)) message += '選用的版本已列入略過名單，請先讓 AI 調整選用版本再重開 K。';
+          return {message, restartRequired: false};
+        }
+        const readyMessage =
+          `${names[provider]} ${next.version} 已準備好；` +
+          (provider === 'gemini'
+            ? '重新開啟前請先讓 AI 跑權限檢查。通過後再離開並停止 K，重新開啟即生效。'
+            : '離開並停止 K 後，重新開啟即生效。');
+        if (entry?.version === next.version && entry.version !== current)
           return {
-            message: `${names[provider]} ${next.version} 已準備好；離開並停止 K 後，重新開啟即生效。`,
+            message: readyMessage,
             restartRequired: true
           };
         if (current && !newer(next.version, current))
@@ -353,8 +391,10 @@ export function createCoreUpdates({
         const file = await download(next, directory, {signal});
         if ((await inspect(file, signal, versionEnvironment(process.env, versionEnv), provider)) !== next.version)
           throw Error('下載版本讀回不符，原核心保持不變。');
-        let previous =
-          selected[provider]?.version === current ? selected[provider] : (selected[provider]?.previous ?? null);
+        let previous = entry?.version === current ? entry : (entry?.previous ?? null);
+        // A pending rollback may be the only usable predecessor while a withheld core is still running.
+        if (withheld.has(previous?.version ?? current))
+          previous = [entry, entry?.previous].find(core => core?.version && !withheld.has(core.version)) ?? previous;
         // The first Gemini core may be the shared official install. Preserve its binary
         // inside K without altering that installation or any login data.
         if (!previous && provider === 'gemini' && active.gemini) {
@@ -373,7 +413,7 @@ export function createCoreUpdates({
         const pruned = await pruneCores(provider, [file, previous?.file, active[provider]], signal).catch(error => error);
         return {
           message:
-            `${names[provider]} ${next.version} 已準備好；離開並停止 K 後，重新開啟即生效。` +
+            readyMessage +
             (pruned instanceof Error ? '（更舊的版本沒有清理完成，可能只有部分移到資源回收筒；剩下的會在這個核心下次更新到新版時再清。）' : ''),
           restartRequired: true
         };

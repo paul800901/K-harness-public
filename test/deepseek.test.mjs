@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import path from 'node:path';
-import {mkdir, mkdtemp, readFile, writeFile} from 'node:fs/promises';
+import {mkdir, mkdtemp, readFile, realpath, writeFile, symlink} from 'node:fs/promises';
 import {randomUUID, createHash} from 'node:crypto';
 import {zstdCompressSync} from 'node:zlib';
 import {PassThrough} from 'node:stream';
@@ -30,6 +30,8 @@ import {newer, officialCoreRelease, downloadCoreRelease, verifyAuthenticode} fro
 import {modelProvider} from '../shared/model-provider.mjs';
 import {availableWorkerModels, workerPolicyConfig} from '../src/worker-policy.mjs';
 import {createLunaBridge} from '../src/luna-bridge.mjs';
+import {createUnifiedController} from '../src/unified-controller.mjs';
+import {listMainSessions} from '../src/main-sessions.mjs';
 import {scratchBase} from './scratch.mjs';
 
 const value = model => JSON.stringify(['deepseek-official', model]);
@@ -154,6 +156,190 @@ async function controllerFixture(scripts, extra = {}) {
 const settle = async controller => {
   for (let i = 0; i < 200 && controller.state.busy; i++) await new Promise(r => setTimeout(r, 5));
 };
+
+test('DeepSeek relocation refuses a different physical directory before closing or changing the old room', async () => {
+  const f = await controllerFixture([]),
+    c = f.controller;
+  const unified = createUnifiedController({root: f.root, deepseekFactory: () => c});
+  try {
+    const room = await unified.open({model: 'deepseek-flash', effort: 'off'});
+    await unified.send({text: 'original'});
+    await settle(c);
+    const destination = path.join(f.root, 'destination');
+    await mkdir(destination);
+    const rawFile = path.join(f.root, '.runtime', 'deepseek-sessions', `${room.threadId}.json`);
+    const beforeFile = await readFile(rawFile, 'utf8');
+    const beforeCommon = (await listMainSessions(f.root, {threadId: room.threadId})).sessions[0];
+    const beforeState = structuredClone(c.state),
+      calls = f.fake.calls.length;
+    await assert.rejects(unified.moveWorkspace({...room, workspace: destination}), /不同實體目錄.*新聊天室/u);
+    assert.deepEqual(c.state, beforeState);
+    assert.equal(await readFile(rawFile, 'utf8'), beforeFile);
+    assert.deepEqual((await listMainSessions(f.root, {threadId: room.threadId})).sessions[0], beforeCommon);
+    assert.equal(f.fake.calls.length, calls, 'no native close or request on rejection');
+    await unified.send({text: 'still usable'});
+    await settle(c);
+    assert.equal(f.fake.agents.length, 1);
+    assert.equal(f.fake.calls.filter(row => row.method === 'session/prompt').length, 2);
+    // An alias of the same physical workspace is accepted, preserving the native session.
+    const alias = path.join(await scratch('deepseek-alias'), 'alias');
+    await symlink(f.root, alias, process.platform === 'win32' ? 'junction' : 'dir');
+    await unified.moveWorkspace({...room, workspace: alias});
+    assert.equal(c.state.workspace, f.root, 'workspace validation canonicalizes aliases');
+    await c.open({...room, model: 'deepseek-flash'}, {relocation: {workspace: alias}});
+    await unified.send({text: 'same physical directory'});
+    await settle(c);
+    assert.equal(f.fake.calls.filter(row => row.method === 'session/resume').length, 1);
+  } finally {
+    await unified.close();
+  }
+});
+
+test('an empty DeepSeek room can move before a native session is created', async () => {
+  const f = await controllerFixture([]),
+    c = f.controller;
+  try {
+    const room = await c.open({model: 'deepseek-flash', effort: 'off'});
+    const destination = path.join(f.root, 'destination');
+    await mkdir(destination);
+    await c.open({...room, model: 'deepseek-flash'}, {relocation: {workspace: destination}});
+    assert.equal(c.state.workspace, destination);
+    assert.equal(f.fake.agents.length, 0);
+  } finally {
+    await c.close();
+  }
+});
+
+test('a persisted ACP room refuses relocation even when the native model catalog is unavailable', async () => {
+  const f = await controllerFixture([]);
+  const c = f.controller;
+  try {
+    const room = await c.open({model: 'deepseek-flash', effort: 'off'});
+    await c.send({text: 'original'});
+    await settle(c);
+    const destination = path.join(f.root, 'destination');
+    await mkdir(destination);
+    c.models = async () => { throw Error('catalog unavailable'); };
+    await assert.rejects(c.open({...room, model: 'deepseek-flash'}, {relocation: {workspace: destination}}), /不同實體目錄/u);
+    assert.equal(f.fake.agents[0].exited, false);
+  } finally {
+    await c.close();
+  }
+});
+
+test('relocation only reports the same workspace for the same canonical directory', async t => {
+  const f = await controllerFixture([]);
+  const unified = createUnifiedController({root: f.root, deepseekFactory: () => f.controller});
+  try {
+    const original = path.join(f.root, '\u0130'), other = path.join(f.root, 'i\u0307');
+    await mkdir(original);
+    await mkdir(other, {recursive: true});
+    if (await realpath(original) === await realpath(other)) return t.skip('filesystem aliases these two names');
+    const room = await unified.open({model: 'deepseek-flash', effort: 'off'});
+    await unified.moveWorkspace({...room, workspace: original});
+    await unified.send({text: 'original'});
+    await settle(f.controller);
+    await assert.rejects(unified.moveWorkspace({...room, workspace: other}), /不同實體目錄/u);
+    if (process.platform === 'win32') {
+      const alternate = original.replace(/^[a-z]:/i, drive => drive.toLowerCase());
+      assert.equal((await unified.moveWorkspace({...room, workspace: alternate})).workspace, original);
+    }
+    assert.equal(f.controller.state.workspace, original);
+    assert.equal(f.fake.agents[0].exited, false);
+  } finally {
+    await unified.close();
+  }
+});
+
+test('DSH next-turn splices remove, replace and retain pending entries across the process sequence boundary', async () => {
+  const home = await scratch('deepseek-splices'),
+    id = randomUUID();
+  const folder = path.join(home, 'sessions', '--ws--', id);
+  await mkdir(folder, {recursive: true});
+  const log = [],
+    splice = (seq, start, removedCount, inserted, target = 'next-turn') => ({
+      seq,
+      type: 'agent/inbox/spliced',
+      data: {target, start, removedCount, inserted: inserted.map(id => ({id}))}
+    });
+  const state = async () => {
+    await writeFile(
+      path.join(folder, 'session.v4.jsonl.zstd'),
+      zstdCompressSync(Buffer.from(log.map(e => JSON.stringify(e)).join('\n') + '\n'))
+    );
+    return dshSessionState(home, id, {afterSeq: 10});
+  };
+  log.push(splice(9, 0, 0, ['old']), splice(11, 1, 0, ['new1', 'new2']));
+  assert.equal((await state()).queued, true);
+  log.push(splice(12, 1, 1, []));
+  assert.equal((await state()).queued, true, 'one current-process entry remains');
+  log.push(splice(13, 1, 1, []));
+  assert.equal((await state()).running, false, 'only the predecessor entry remains');
+  log.push(splice(14, 0, 1, ['replacement']));
+  assert.equal((await state()).queued, true);
+  log.push(splice(15, 0, 1, []));
+  assert.equal((await state()).running, false, 'last pending turn was withdrawn');
+  log.push({seq: 16, type: 'turn/start'}, splice(17, 0, 0, ['during-open']), {seq: 18, type: 'turn/end'});
+  assert.equal((await state()).queued, true, 'queued while a turn ran');
+  log.push(splice(19, 0, 1, [], 'next-step'));
+  assert.equal((await state()).queued, true, 'other inbox is independent');
+  log.push(splice(20, 0, 1, []));
+  assert.equal((await state()).running, false);
+  log.length = 0;
+  log.push(splice(10, 0, 0, ['on-boundary']));
+  assert.equal((await state()).queued, false);
+  log.push(splice(11, 1, 0, ['second']), {seq: 12, type: 'turn/start'});
+  assert.equal((await state()).queued, true, 'turn/start is logged before the core claims one item');
+  log.push(splice(13, 0, 1, []), {seq: 14, type: 'turn/end'});
+  assert.equal((await state()).queued, true, 'claiming the older item leaves the newer one pending');
+  log.push(splice(15, 0, 1, []));
+  assert.equal((await state()).running, false);
+});
+
+test('DSH goal rounds follow admitted messages of the current goal and revision only', async () => {
+  const home = await scratch('deepseek-rounds'),
+    id = randomUUID();
+  const folder = path.join(home, 'sessions', '--ws--', id);
+  await mkdir(folder, {recursive: true});
+  const goal = {id: 'goal-a', revision: 1, objective: '目標', phase: 'active', maxGoalRounds: 5};
+  const log = [{type: 'goal/change', data: {operation: 'create', goal, roundsStarted: 0}}];
+  const round = (goalId, revision, round) => ({
+    type: 'user/message',
+    data: {source: {kind: 'goal', goalId, revision, round}}
+  });
+  const state = async options => {
+    await writeFile(
+      path.join(folder, 'session.v4.jsonl.zstd'),
+      zstdCompressSync(Buffer.from(log.map((e, seq) => JSON.stringify({...e, seq})).join('\n') + '\n'))
+    );
+    return dshSessionState(home, id, options);
+  };
+  log.push(round('goal-a', 1, 1), {type: 'turn/end'});
+  assert.equal((await state()).goal.rounds, 1);
+  log.push(round('other', 1, 2), round('goal-a', 0, 2), round('goal-a', 1, 4));
+  assert.equal((await state()).goal.rounds, 1);
+  log.push(
+    {type: 'goal/change', data: {operation: 'update', goal: {...goal, revision: 2}, roundsStarted: 1}},
+    round('goal-a', 1, 2)
+  );
+  assert.equal((await state()).goal.rounds, 1);
+  log.push(round('goal-a', 2, 2));
+  assert.equal((await state()).goal.rounds, 2);
+  log.push({type: 'goal/change', data: {operation: 'clear'}}, round('goal-a', 2, 3));
+  assert.equal((await state()).goal, null);
+  log.push({type: 'goal/change', data: {goal: {...goal, revision: undefined}, roundsStarted: 0}}, round('goal-a', undefined, 1));
+  assert.equal((await state()).goal.rounds, 0, 'two missing revisions do not identify an admitted round');
+  log.push({type: 'goal/change', data: {goal: {...goal, maxGoalRounds: 1}, roundsStarted: 0}}, {type: 'turn/start'});
+  const startedAt = log.length - 1;
+  log.push(round('goal-a', 1, 1), round('goal-a', 1, 2));
+  assert.equal((await state()).goal.rounds, 1, 'a round beyond the goal limit is not admitted');
+  assert.equal((await state()).goalRound, 1);
+  assert.equal((await state({afterSeq: startedAt})).goalRound, undefined, 'old process turn is not displayed as live');
+  log.push({type: 'turn/end'}, {type: 'turn/start'}, {type: 'user/message', data: {source: {kind: 'user'}}});
+  assert.equal((await state()).goalRound, undefined, 'an ordinary turn does not inherit the preceding goal round');
+  log.push({type: 'goal/change', data: {goal: {...goal, phase: 'paused'}, roundsStarted: 1}}, round('goal-a', 1, 2));
+  assert.equal((await state()).goal.rounds, 1);
+});
 
 // A trimmed copy of the official price page table (2026-11-03).
 const PRICE_HTML = `<table><tr><th>模型</th><th>deepseek-flash (1)</th><th>deepseek-v4-pro</th></tr>
@@ -820,15 +1006,35 @@ test('background jobs still running after a turn keep the room working; stopping
   native.jobs = [{id: 'pwsh-1', label: 'npm test'}];
   await settle(controller);
   await until(() => controller.state.busy, 'a running background job keeps the room working');
+  assert.equal(controller.backgroundWork, 'DeepSeek 背景工作執行中（1 個）');
   assert.match(controller.state.messages.findLast(m => m.kind === 'native-autonomous').summary, /背景工作執行中（1 個）/u);
   assert.deepEqual(controller.state.nativeJobs, [{id: 'pwsh-1', label: 'npm test'}]);
   await assert.rejects(controller.send({text: 'too early'}), /請先結束或查明目前 DeepSeek 工作/);
   await controller.stopTurn();
   assert.ok(fake.calls.some(c => c.method === 'session/cancel'));
   assert.equal(fake.agents[0].exited, true, 'closing the process ends DSH’s jobs and rounds with it');
+  assert.equal(controller.backgroundWork, null);
   assert.equal(controller.state.busy, false);
   assert.equal(controller.state.status, 'interrupted');
   await controller.close();
+});
+
+test('a DeepSeek autonomous turn displays only the goal round admitted by the native log', async () => {
+  const {controller, fake, native} = await nativeFixture();
+  try {
+    await controller.send({text: '建立目標'});
+    await settle(controller);
+    Object.assign(native, {running: true, open: true, goal: {objective: '兩輪', status: 'active', rounds: 2, maxRounds: 2}});
+    await controller.goal({refresh: true});
+    fake.agents[0].emit({sessionUpdate: 'agent_message_chunk', content: {type: 'text', text: '繼續'}});
+    const summary = () => controller.state.messages.findLast(m => m.kind === 'native-autonomous');
+    assert.doesNotMatch(summary().text, /第 \d+ 輪/u, 'a session update can be unrelated to the active goal');
+    native.goalRound = 2;
+    await until(() => summary()?.text.includes('第 2 輪'), 'display the admitted round, including at the round limit');
+    assert.equal(summary().summary, summary().text);
+  } finally {
+    await controller.close();
+  }
 });
 
 test('the DeepSeek goal is read from DSH and set by talking to DeepSeek, not by a K command', async () => {

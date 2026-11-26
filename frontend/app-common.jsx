@@ -48,7 +48,11 @@ export const api = async (route, data) => {
   } catch {
     throw Error(data === undefined ? '無法讀取電腦狀態。' : '操作結果未確認；沒有自動重送。請重新連線讀回後再決定。');
   }
-  if (!r.ok) throw Error(v.error ?? '請求失敗');
+  if (!r.ok) {
+    const error = Error(v.error ?? '請求失敗');
+    if (r.status === 409 && Array.isArray(v.busy)) error.busy = v.busy;
+    throw error;
+  }
   return v;
 };
 export const readSidebarPreference = (key, fallback, allowed) => {

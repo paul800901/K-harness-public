@@ -60,6 +60,7 @@ export const DEEPSEEK_PROFILE = {
   // DSH ignores ACP session metadata (live probe), cannot load a session, and fixes its sandbox at launch.
   metaRules: false,
   loadFallback: false,
+  resumeSameDirectory: true,
   processPerAccessMode: true,
   // ...but only for a new session: a resumed one keeps the permission pinned in its own log.
   sessionAccess: dshSessionAccess,

@@ -821,6 +821,10 @@ export function createAcpController(
   function applyNative(native) {
     state.goal = native.goal;
     state.nativeJobs = native.jobs;
+    if (turn?.native && native.goalRound) {
+      const message = state.messages.findLast(m => m.id === turn.turnId);
+      if (message) message.text = message.summary = `DeepSeek 自主繼續：目標第 ${native.goalRound} 輪`;
+    }
   }
   function watchNative() {
     if (!profile.nativeState || !record?.nativeSessionId || roomClosing) return;
@@ -1010,7 +1014,7 @@ export function createAcpController(
     try {
       await current.close();
     } catch (error) {
-      agentUnresolved = current.pid;
+      agentUnresolved = current;
       throw error;
     }
   }
@@ -1081,11 +1085,7 @@ export function createAcpController(
     let current = turn;
     if (profile.nativeState) {
       if (!current && message.method === 'session/update' && !stopping)
-        current = beginNativeTurn(
-          state.goal?.status === 'active'
-            ? `DeepSeek 自主繼續：目標第 ${state.goal.rounds + 1} 輪`
-            : 'DeepSeek 自主繼續工作'
-        );
+        current = beginNativeTurn('DeepSeek 自主繼續工作');
       checkNative();
     }
     if (!current || current.loading) return;
@@ -1170,7 +1170,7 @@ export function createAcpController(
         signal: current.abort.signal
       });
     } catch (error) {
-      if (error.unresolvedPid) agentUnresolved = error.unresolvedPid;
+      if (error.unresolvedPid) agentUnresolved = error.unresolvedProcess ?? {pid: error.unresolvedPid};
       throw error;
     }
     // Held before any session request, so a stop can always reach the process.
@@ -1223,6 +1223,10 @@ export function createAcpController(
 
   const api = {
     state,
+    get backgroundWork() {
+      if (agentUnresolved) return `${label} 程序停止待確認`;
+      return agent && !agent.exited && state.nativeJobs?.length ? `${label} 背景工作執行中（${state.nativeJobs.length} 個）` : null;
+    },
     async models() {
       return {models: await login.models(), provider};
     },
@@ -1293,9 +1297,7 @@ export function createAcpController(
       if (continuation && (continuation.mode !== 'fresh' || threadId))
         throw Object.assign(Error(`接續只能建立全新的 ${label} 聊天室；未建立新聊天室。`), {notCreated: true});
       idle();
-      activity.clear();
       opening = true;
-      usageSeq++;
       let previousClosed = false,
         saving = false;
       const originalWorkspace = relocation
@@ -1314,14 +1316,22 @@ export function createAcpController(
           throw Error('對話設定已更新，請重新整理清單。');
         if (saved?.nativeStarted && !nativeId(saved.nativeSessionId))
           throw Error(`上次 ${label} 送出後尚未取得原生對話 ID；不能自動建立新對話或重送。`);
-        const {choice, level} = choose((await api.models()).models, model, effort ?? saved?.effort),
-          mode = access(saved?.accessMode ?? accessMode);
-        if (!saved && mode === 'danger-full-access' && !permissionConfirmed)
-          throw Error(`請明確確認 ${label} 完整存取權。`);
         const common = threadId ? (await listMainSessions(root, {threadId})).sessions[0] : null;
         const workspace = await validateWorkspace(
           relocation?.workspace ?? common?.workspace ?? saved?.workspace ?? state.workspace
         );
+        // These cores bind resume/load to the original physical directory. Refuse before closing the old
+        // process or changing presentation/persistence, including when called outside the unified API.
+        if (
+          relocation && saved?.nativeSessionId && profile.resumeSameDirectory &&
+          workspace !== (await validateWorkspace(saved.workspace))
+        )
+          throw Error(`${label} 已有原生對話的聊天室無法移到不同實體目錄；請在新工作區開新聊天室。`);
+        signal?.throwIfAborted();
+        const {choice, level} = choose((await api.models()).models, model, effort ?? saved?.effort),
+          mode = access(saved?.accessMode ?? accessMode);
+        if (!saved && mode === 'danger-full-access' && !permissionConfirmed)
+          throw Error(`請明確確認 ${label} 完整存取權。`);
         signal?.throwIfAborted();
         const policy = normalizeWorkerPolicy(workerPolicy ?? saved?.workerPolicy ?? common?.workerPolicy);
         if (
@@ -1330,6 +1340,8 @@ export function createAcpController(
           (await unsettledWorkers())
         )
           throw Error(WORKERS_RUNNING);
+        activity.clear();
+        usageSeq++;
         await closeAgent();
         await resetBrowser();
         previousClosed = true;
@@ -1711,7 +1723,7 @@ export function createAcpController(
       try {
         await api.stopTurn();
         if (agentUnresolved) {
-          await killTree(agentUnresolved);
+          if (!agentUnresolved.exited) await killTree(agentUnresolved.pid);
           agentUnresolved = null;
           state.status = 'interrupted';
           state.error = null;

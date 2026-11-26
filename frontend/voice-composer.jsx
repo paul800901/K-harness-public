@@ -103,7 +103,7 @@ export function useVoiceComposer({onResult, onBackgroundResult, disabled: blocke
         if (error) setNotice(`${error} 未送出；原草稿保留。`);
         else if (!result.text.trim()) setNotice('沒有辨識到文字，未送出訊息。');
         else {
-          callback.current(remote ? {...result, send: false} : result);
+          callback.current(result);
           if (entry.hitLimit) setNotice('已達 5 分鐘上限；辨識已完成。');
         }
         return true;
@@ -125,7 +125,7 @@ export function useVoiceComposer({onResult, onBackgroundResult, disabled: blocke
     if (error) backgroundNotices.set(entry.scope, `${error} 未送出；原草稿保留。`);
     else if (!result.text.trim()) backgroundNotices.set(entry.scope, '沒有辨識到文字，未送出訊息。');
     else
-      void Promise.resolve(entry.backgroundResult(remote ? {...result, send: false} : result)).then(message => {
+      void Promise.resolve(entry.backgroundResult(result)).then(message => {
         if (message) backgroundNotices.set(entry.scope, message);
       });
   };
@@ -159,7 +159,7 @@ export function useVoiceComposer({onResult, onBackgroundResult, disabled: blocke
       setPhase(pending.session.getState());
       setNotice(
         pending.notice ??
-          (pending.send && !remote
+          (pending.send
             ? '轉錄完成後會在此聊天室送出。'
             : '轉錄完成後會留在此聊天室草稿，不會自動送出。')
       );
@@ -359,6 +359,7 @@ export function useVoiceComposer({onResult, onBackgroundResult, disabled: blocke
   return {
     phase,
     notice,
+    setNotice,
     canvas,
     start,
     stop,

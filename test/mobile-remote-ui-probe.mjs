@@ -516,7 +516,7 @@ try {
   await page.getByRole('button', {name: '開始聽寫', exact: true}).click();
   await page.getByRole('button', {name: '停止聽寫', exact: true}).waitFor();
   await wait(700);
-  assert.equal(await page.getByRole('button', {name: '轉錄完成後送出', exact: true}).count(), 0);
+  await page.getByRole('button', {name: '轉錄完成後送出', exact: true}).waitFor();
   await screenshot('mobile-dictation-recording');
   await noOverflow(page);
   await page.getByRole('button', {name: '停止聽寫', exact: true}).click();

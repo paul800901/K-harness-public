@@ -91,6 +91,15 @@ try {
         if (route.request().method() === 'POST') {
           const data = route.request().postDataJSON();
           calls.push({endpoint, data});
+          if (endpoint === '/api/stop') {
+            assert.deepEqual(data, {threadId: 'unread', backgroundOnly: true});
+            await route.fulfill({json: {stopped: true}});
+            await emit({
+              backgroundWork: null,
+              conversationActivity: state.conversationActivity.map(a => ({...a, backgroundWork: null}))
+            });
+            return;
+          }
           if (endpoint === '/api/sidebar/preferences') {
             state.sidebarPreferences = {...state.sidebarPreferences, ...data};
             await route.fulfill({json: state.sidebarPreferences});
@@ -229,6 +238,39 @@ try {
       assert.deepEqual(state.sidebarPreferences.order, manualOrder);
       assert.ok(calls.filter(c => c.endpoint === '/api/sidebar/preferences').every(c => !('order' in c.data)));
       assert.equal(calls.filter(c => ['/api/send', '/api/stop', '/api/goal'].includes(c.endpoint)).length, 0);
+      if (theme === 'warm') {
+        const label = 'agy 背景程序保留中';
+        const geminiModel = 'gemini-3.8-flash';
+        sessions.find(s => s.threadId === 'unread').model = geminiModel;
+        await emit({
+          provider: 'gemini',
+          model: geminiModel,
+          backgroundWork: label,
+          workers: [{requestId: 'held', kind: 'command', status: 'running'}],
+          conversationActivity: state.conversationActivity.map(a => a.threadId === 'unread' ? {...a, backgroundWork: label} : a)
+        });
+        const badge = page.locator('.session-open').filter({hasText: '完成未讀成果'}).getByText('背景工作', {exact: true});
+        await badge.waitFor();
+        assert.equal(await badge.getAttribute('aria-label'), label);
+        await bell.click();
+        await page.locator('.activity-list').waitFor();
+        await badge.waitFor();
+        assert.deepEqual(await titles(), ['完成未讀成果']);
+        if (width < 600) await page.locator('.session-open').filter({hasText: '完成未讀成果'}).click();
+        await page.locator('.working-indicator').getByText(label, {exact: false}).waitFor();
+        await page.getByText('無未結束的子代理', {exact: true}).waitFor();
+        const input = page.locator('.composer-card textarea'), stop = page.getByRole('button', {name: '停止本房背景工作'});
+        await input.fill('保留草稿');
+        assert.equal(await page.getByRole('button', {name: '送出訊息', exact: true}).isEnabled(), true);
+        await page.screenshot({path: path.join(output, `held-${width}.png`)});
+        await stop.click();
+        await stop.waitFor({state: 'detached'});
+        assert.equal(await input.inputValue(), '保留草稿');
+        assert.equal(calls.filter(c => c.endpoint === '/api/stop').length, 1);
+        assert.equal(calls.filter(c => c.endpoint === '/api/send').length, 0);
+        if (width < 600) await page.getByRole('button', {name: '展開側欄', exact: true}).click();
+        await page.getByText('目前沒有執行中、待處理或完成未讀的聊天室', {exact: true}).waitFor();
+      }
       results.push({theme, width, geometry, rowGeometry, passed: true});
       await page.close();
     }

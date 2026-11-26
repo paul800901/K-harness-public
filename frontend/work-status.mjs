@@ -93,6 +93,7 @@ export function workStatus(state, online = true, now = Date.now()) {
     !['offline', 'error', 'uncertain', 'connecting'].includes(state.status) && state.workerConnection !== 'failed';
   const children = pendingWorkerSummary(currentWorkers(state), connected, now);
   const pendingText = [
+    state.backgroundWork,
     workerSummaryText(children),
     children.historicalUnconfirmed ? `舊工單結果待確認：${children.historicalUnconfirmed} 個` : ''
   ]
@@ -116,7 +117,7 @@ export function workStatus(state, online = true, now = Date.now()) {
           : 'danger',
       text: terminal[state.status] + (pendingText ? ` · ${pendingText}` : '')
     };
-  if (state.questions?.length) return {kind: 'confirmation', text: '等待你的確認'};
+  if (state.questions?.length) return {kind: 'confirmation', text: ['等待你的確認', state.backgroundWork].filter(Boolean).join(' · ')};
   if (!state.busy && state.status !== 'working')
     return pendingText
       ? {
@@ -148,6 +149,6 @@ export function workStatus(state, online = true, now = Date.now()) {
   const detail = stale ? `已 ${formatElapsed(quiet)}無新活動回報` : freshness;
   return {
     kind: stale || !a ? 'warning' : 'running',
-    text: `${phase}${wait} · ${detail}${a?.phase === 'worker' && pendingText ? ` · ${pendingText}` : ''}`
+    text: [`${phase}${wait} · ${detail}`, a?.phase === 'worker' ? pendingText : state.backgroundWork].filter(Boolean).join(' · ')
   };
 }

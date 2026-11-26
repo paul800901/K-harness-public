@@ -27,6 +27,7 @@ export function conversationPreview(record = {}, history) {
     accessMode: history?.accessMode ?? record.accessMode,
     status: 'connecting',
     busy: false,
+    backgroundWork: null,
     error: null,
     turnError: null,
     workerConnection: null,

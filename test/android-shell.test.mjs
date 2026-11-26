@@ -22,7 +22,8 @@ test('the attention summary carries unread rooms with titles and the working cou
       {threadId: 'a', title: '例行追蹤', busy: false},
       {threadId: 'b', title: '', busy: false},
       {threadId: 'c', title: '翻譯', busy: true},
-      {threadId: 'd', title: '子代理', busy: false, pendingWorkers: 1}
+      {threadId: 'd', title: '子代理', busy: false, pendingWorkers: 1, backgroundWork: 'Claude 背景命令未結束'},
+      {threadId: 'e', title: '背景工作', busy: false, backgroundWork: 'agy 背景程序保留中'}
     ]
   });
   assert.deepEqual(summary, {
@@ -32,7 +33,7 @@ test('the attention summary carries unread rooms with titles and the working cou
       {threadId: 'b', sequence: 4, kind: 'attention', title: '未命名聊天室'},
       {threadId: 'gone', sequence: 2, kind: 'completed', title: '未命名聊天室'}
     ],
-    working: 2
+    working: 3
   });
   assert.deepEqual(attentionSummary({}), {sequence: 0, unread: [], working: 0});
 });

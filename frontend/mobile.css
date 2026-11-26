@@ -98,3 +98,6 @@
  dialog.image-viewer{width:100%}.image-viewer-picture{max-height:calc(var(--mobile-height,100dvh) - 170px)}
  .schedule-item{overflow-wrap:anywhere}.schedule-item-header>span{max-width:100%}
 }
+.chat-selection-repaired ::selection,.chat-selection-repaired::selection{background:transparent}
+::highlight(k-chat-selection){background-color:Highlight;color:HighlightText}
+.chat-selection-active .header-title{user-select:none}

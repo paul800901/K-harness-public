@@ -68,6 +68,7 @@ import kLogo from './assets/k-logo.jpg';
 import {DeepSeekRoomUsage, Usage, UsageDetails} from './usage.jsx';
 import './sidebar.css';
 import {useAnchoredPopover} from './anchored-popover.jsx';
+import {PositionDialog} from './position-dialog.jsx';
 import {ProjectSidebar} from './project-sidebar.jsx';
 import {conversationPreview} from '../shared/conversation-preview.mjs';
 import {useCompletionAttention} from './completion-attention.jsx';
@@ -336,7 +337,7 @@ const ChatView = React.memo(function ChatView({
         attachmentIds: uploads.filter(a => a.id).map(a => a.id),
         accessMode: effectiveAccessMode,
         permissionConfirmed,
-        ...(effort ? {effort} : {})
+        ...(!state.busy && effort ? {effort} : {})
       };
     if (quotes.length && utf8ByteLength(JSON.stringify(payload)) > MAX_SEND_BODY_BYTES) {
       setQuoteNotice('引用、註解與訊息合計太長，未送出；請縮短或移除部分引用。');
@@ -483,7 +484,9 @@ const ChatView = React.memo(function ChatView({
         existing = composer.getState().text;
       composer.setText(existing + (existing && !/\s$/.test(existing) ? '\n' : '') + text);
       setDraftText(composer.getState().text);
-      if (send) queueDraft();
+      if (!send) return;
+      if (!online) voice.setNotice('目前未連線，聽寫文字已留在草稿，請在連線後送出。');
+      else queueDraft();
     }
   });
   const startComposerVoice = () => {
@@ -619,6 +622,8 @@ const ChatView = React.memo(function ChatView({
                     connecting={connecting}
                     loginRequired={loginRequired}
                     footer
+                    onStopBackground={() => roomAction(threadId, () => threadApi('stop', {backgroundOnly: true}))}
+                    stopDisabled={blocked || connecting || loginRequired}
                   />
                 )}
               </div>
@@ -929,18 +934,16 @@ const ChatView = React.memo(function ChatView({
                         >
                           <Square size={15} />
                         </button>
-                        {!remoteClient && (
-                          <button
-                            type="button"
-                            className="send-button"
-                            aria-label="轉錄完成後送出"
-                            title="轉錄完成後送出"
-                            disabled={voice.phase === 'starting' || blocked || uploads.some(a => a.loading)}
-                            onClick={() => voice.stop(true)}
-                          >
-                            <ArrowUp size={21} />
-                          </button>
-                        )}
+                        <button
+                          type="button"
+                          className="send-button"
+                          aria-label="轉錄完成後送出"
+                          title="轉錄完成後送出"
+                          disabled={voice.phase === 'starting' || blocked || uploads.some(a => a.loading)}
+                          onClick={() => voice.stop(true)}
+                        >
+                          <ArrowUp size={21} />
+                        </button>
                       </>
                     ) : (
                       <>
@@ -1071,7 +1074,7 @@ function App() {
     voiceCall = useVoiceCall(online && enabled('emma')),
     [models, setModels] = useState([]),
     [uploadsByThread, setUploadsByThread] = useState({}),
-    [effort, setEffort] = useState(''),
+    [effortDrafts, setEffortDrafts] = useState({}),
     [accessMode, setAccessMode] = useState('workspace-write'),
     [theme, setTheme] = useState(() => readTheme()),
     [panelWidth, setPanelWidth] = useState(null);
@@ -1115,6 +1118,18 @@ function App() {
           )
         }
       : receivedState;
+  const effortDraft = effortDrafts[state.threadId];
+  const effort = effortDraft && effortDraft.model === state.model ? effortDraft.value : '';
+  const setEffort = value => {
+    const {threadId, model} = state;
+    setEffortDrafts(current => {
+      if (value) return {...current, [threadId]: {model, value}};
+      if (!current[threadId]) return current;
+      const next = {...current};
+      delete next[threadId];
+      return next;
+    });
+  };
   useEffect(() => {
     if (
       navigationTarget?.settled &&
@@ -1431,7 +1446,7 @@ function App() {
         setSelfUpdate(current => ({...current, updating: true}));
         setSelfUpdateNotice('K 更新中…');
       })
-      .catch(e => setSelfUpdateNotice(e.message));
+      .catch(e => setSelfUpdateNotice([e.message, ...(e.busy ?? [])].join('\n')));
   };
   useEffect(() => {
     if (!mobile || (!sidebar && !inspector)) return;
@@ -1439,6 +1454,9 @@ function App() {
       main = appRef.current?.querySelector('main'),
       before = document.activeElement;
     if (!panel) return;
+    const selected = window.getSelection();
+    if (selected && !selected.isCollapsed && (main?.contains(selected.anchorNode) || main?.contains(selected.focusNode)))
+      selected.removeAllRanges();
     main?.setAttribute('inert', '');
     panel.querySelector('button')?.focus();
     const close = () => {
@@ -1513,7 +1531,6 @@ function App() {
   useEffect(() => {
     previewRequest.current++;
     setModal(current => (['preview', 'goal', 'conversation-options'].includes(current?.type) ? null : current));
-    setEffort('');
     setNotice('');
     setAccessMode(state.accessMode ?? 'workspace-write');
     setPermissionConfirmed(false);
@@ -1523,8 +1540,13 @@ function App() {
     setBrowserInfo(null);
   }, [state.threadId]);
   useEffect(() => {
-    setEffort('');
-  }, [state.model, state.effort]);
+    if (
+      !state.connectionOpening &&
+      effortDraft &&
+      (effortDraft.model !== state.model || effortDraft.value === state.effort)
+    )
+      setEffort('');
+  }, [state.threadId, state.model, state.effort, state.connectionOpening, effortDraft]);
   useEffect(() => {
     if (state.busy) setNotice('');
   }, [state.busy]);
@@ -1727,7 +1749,6 @@ function App() {
       const result = await api('fork', {...selection, threadId: modal.threadId});
       if (!result.threadId) throw Error('分支未回傳新對話識別碼。');
       setModal(null);
-      setEffort('');
       await refresh();
     });
   const createConversation = selection =>
@@ -2103,7 +2124,8 @@ function App() {
                   threadId: session.threadId,
                   busy: session.busy,
                   pendingQuestions: session.pendingQuestions,
-                  pendingWorkers: session.pendingWorkers
+                  pendingWorkers: session.pendingWorkers,
+                  backgroundWork: session.backgroundWork
                 }))
               }
               layout={sidebarLayout}
@@ -2113,6 +2135,7 @@ function App() {
               onRename={session => setModal({type: 'rename', session})}
               onMetadata={data => action(() => metadata(data))}
               onMove={moveConversation}
+              onPosition={source => setModal({type: 'position', ...source})}
               onMoveProject={moveProject}
               onMoveWorkspace={moveToWorkspace}
               onChooseWorkspace={session => setModal({type: 'move-workspace', session})}
@@ -2853,6 +2876,18 @@ function App() {
               state={state}
               onClose={() => setModal(null)}
               onFork={forkConversation}
+            />
+          )}
+          {modal?.type === 'position' && (
+            <PositionDialog
+              source={modal}
+              projects={projects}
+              sessions={sessions}
+              order={manualOrder}
+              projectOrder={projectOrder}
+              manual={sidebarSort === 'manual'}
+              onSave={saveSidebar}
+              onClose={() => setModal(null)}
             />
           )}
           {modal?.type === 'move-workspace' && (

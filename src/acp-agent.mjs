@@ -100,7 +100,16 @@ export async function openAcpAgent({
         .then(() => onRequest(message))
         .then(
           result => write({id: message.id, result}),
-          error => write({id: message.id, error: {code: -32603, message: String(error?.message ?? error)}})
+          error => {
+            const code = error?.code;
+            write({
+              id: message.id,
+              error: {
+                code: Number.isInteger(code) && code >= -2147483648 && code <= 2147483647 ? code : -32603,
+                message: String(error?.message ?? error)
+              }
+            });
+          }
         )
         .catch(() => {});
       return;
@@ -147,6 +156,12 @@ export async function openAcpAgent({
   };
   // A stop during initialize ends this process (the caller holds no handle yet) and ends
   // this wait; a stop that cannot be confirmed is reported with the PID, never swallowed.
+  const unresolvedProcess = {
+    pid: child.pid,
+    get exited() {
+      return exited;
+    }
+  };
   let stopped;
   const aborted = new Promise((_, reject) => (stopped = reject));
   aborted.catch(() => {});
@@ -154,7 +169,7 @@ export async function openAcpAgent({
     void agent.close().then(
       () => stopped(Object.assign(Error(`${label} 啟動已停止。`), {name: 'AbortError'})),
       error =>
-        stopped(Object.assign(Error(`${label} 啟動已停止但程序停止未確認：${error.message}`), {unresolvedPid: child.pid}))
+        stopped(Object.assign(Error(`${label} 啟動已停止但程序停止未確認：${error.message}`), {unresolvedPid: child.pid, unresolvedProcess}))
     );
   signal?.addEventListener('abort', abort, {once: true});
   if (signal?.aborted) abort();
@@ -174,7 +189,8 @@ export async function openAcpAgent({
     } catch (closeError) {
       throw Object.assign(Error(`${label} 啟動失敗且程序停止未確認：${closeError.message}`), {
         cause: error,
-        unresolvedPid: child.pid
+        unresolvedPid: child.pid,
+        unresolvedProcess
       });
     }
     throw error;
